@@ -1,0 +1,11 @@
+# Railway service config for the Colyseus game server.
+# Set the root directory of this service to `server/` in the Railway dashboard.
+
+[build]
+buildCommand = "npm run build"
+
+[deploy]
+startCommand  = "node build/index.js"
+healthcheckPath    = "/"
+healthcheckTimeout = 15
+restartPolicyType  = "ON_FAILURE"

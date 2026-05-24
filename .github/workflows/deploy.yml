@@ -1,0 +1,58 @@
+name: Deploy frontend to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "client/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: # allow manual trigger from the Actions tab
+
+# Required permissions for the official Pages deploy action
+permissions:
+  contents: read
+  pages:    write
+  id-token: write
+
+# Only one deployment runs at a time; cancel any in-progress run
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url:  ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build client
+        run: npm run build:client
+        env:
+          # Repository variable set in: Settings → Variables → Actions
+          # Value should be:  wss://your-railway-app.up.railway.app
+          VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL }}
+          # Automatically set the correct sub-path for github.io/repo-name/ URLs.
+          # If you use a custom domain pointing at the repo root, remove this line
+          # (or set VITE_BASE to / in repo variables).
+          VITE_BASE: /${{ github.event.repository.name }}/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: client/dist
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

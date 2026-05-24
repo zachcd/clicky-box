@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Clicky Box</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+
+    <!-- Colorblind toggle — fixed overlay, visible on every screen -->
+    <button id="cb-toggle" aria-pressed="false" title="Colorblind mode: OFF">
+      <span class="cb-icon">👁</span> CB
+    </button>
+
+    <!-- ── Connect ─────────────────────────────────────────────────────────── -->
+    <div id="screen-connect" class="screen">
+      <div class="card">
+        <h1 class="game-title">Clicky Box</h1>
+        <p class="subtitle">Multiplayer colour conquest</p>
+        <div class="field">
+          <input id="name-input" type="text" placeholder="Your name"
+            maxlength="20" autocomplete="off" spellcheck="false" />
+        </div>
+        <button id="join-btn" class="btn btn-primary">Join Lobby</button>
+        <p id="connect-error" class="error-msg"></p>
+      </div>
+    </div>
+
+    <!-- ── Lobby ───────────────────────────────────────────────────────────── -->
+    <div id="screen-lobby" class="screen hidden">
+      <div class="card">
+        <h2 class="card-title">Lobby</h2>
+
+        <!-- Player list -->
+        <ul id="player-list" class="player-list"></ul>
+
+        <!-- Appearance customisation -->
+        <div class="customise">
+          <!-- Color label + custom picker on one row; swatches below at full width -->
+          <div class="custom-row">
+            <span class="custom-label">Color</span>
+            <input type="color" id="custom-color" class="color-pick"
+              title="Custom colour" value="#9B59B6" />
+          </div>
+          <div id="color-swatches" class="swatch-row"></div>
+          <p id="color-warn" class="color-warn"></p>
+          <div class="custom-row">
+            <span class="custom-label">Border</span>
+            <div id="border-style-row" class="bs-row"></div>
+          </div>
+        </div>
+
+        <p id="lobby-status" class="lobby-status"></p>
+        <button id="ready-btn" class="btn btn-ready">Ready Up</button>
+      </div>
+    </div>
+
+    <!-- ── Game ────────────────────────────────────────────────────────────── -->
+    <div id="screen-game" class="screen screen-game hidden">
+
+      <div id="hud">
+        <div id="timer-bar-wrap"><div id="timer-fill"></div></div>
+        <div id="hud-row">
+          <span id="turn-counter"></span>
+          <div id="score-board"></div>
+        </div>
+      </div>
+
+      <!-- Click any cell to select that colour -->
+      <div id="canvas-wrap">
+        <canvas id="grid-canvas"></canvas>
+      </div>
+
+      <!-- Colour picker — button click or Q / W / E / R -->
+      <div id="color-bar">
+        <button class="color-btn" data-color="0"></button>
+        <button class="color-btn" data-color="1"></button>
+        <button class="color-btn" data-color="2"></button>
+        <button class="color-btn" data-color="3"></button>
+      </div>
+    </div>
+
+    <!-- ── Game Over ───────────────────────────────────────────────────────── -->
+    <div id="screen-gameover" class="screen hidden">
+      <div class="card">
+        <h2 class="card-title">Game Over</h2>
+        <p id="winner-line" class="winner-line"></p>
+        <div id="final-scores" class="final-scores"></div>
+        <p id="gameover-note" class="gameover-note"></p>
+        <button id="play-again-btn" class="btn btn-primary">Back to Lobby</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
