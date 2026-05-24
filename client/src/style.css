@@ -152,6 +152,12 @@ input[type="text"]:focus { border-color: var(--accent); }
   box-shadow: 0 0 0 2px rgba(255,255,255,0.3);
   transform: scale(1.15);
 }
+.swatch-btn.taken {
+  opacity: 0.2;
+  cursor: not-allowed;
+  transform: none !important;
+  filter: grayscale(70%);
+}
 
 /* Custom colour input */
 .color-pick {

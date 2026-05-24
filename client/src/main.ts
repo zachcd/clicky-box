@@ -14,25 +14,41 @@ const PLAYER_COLORS = [
   "#00BCD4", "#FF5722", "#7F8C8D", "#795548",
 ] as const;
 
-/** Colour swatches shown in the lobby picker */
-// All colours pre-verified: Euclidean RGB distance ≥ 80 from every grid base colour.
-// None of these will be disabled — they are all safe to use.
-const SWATCH_COLORS = [
-  "#000000", // black
-  "#FFFFFF", // white
-  "#C0C0C0", // silver
-  "#7F8C8D", // grey
-  "#2C3E50", // dark navy
-  "#1A1D8E", // dark indigo
-  "#4A235A", // dark purple
-  "#9B59B6", // purple
-  "#8B0057", // dark magenta
-  "#6D0000", // dark maroon
-  "#5D4037", // dark brown
-  "#3D5016", // dark olive
-  "#0D4D3B", // dark hunter green
-  "#006994", // dark cerulean
-];
+// ─── Player colour palette ─────────────────────────────────────────────────────────────────────
+
+/** Convert HSL (h 0–360, s 0–1, l 0–1) to a #rrggbb hex string. */
+function hslToHex(h: number, s: number, l: number): string {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if      (h < 60)  { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else              { r = c; b = x; }
+  const hex2 = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, "0");
+  return `#${hex2(r)}${hex2(g)}${hex2(b)}`;
+}
+
+/** Player palette: 20 hues × 3 lightness rings, pre-filtered to ≥ 80 Euclidean from every grid colour.
+ *  Mirrors the server-side PLAYER_PALETTE so auto-assigned colours appear in the picker. */
+const PLAYER_PALETTE: ReadonlyArray<string> = (() => {
+  const colours: string[] = [];
+  const hues = Array.from({ length: 20 }, (_, i) => i * 18);
+  // vivid (S=85 % L=45 %), pastel (S=70 % L=70 %), dark (S=80 % L=30 %)
+  for (const [s, l] of [[0.85, 0.45], [0.70, 0.70], [0.80, 0.30]] as [number, number][]) {
+    for (const h of hues) {
+      const c = hslToHex(h, s, l);
+      if (passesContrastCheck(c)) colours.push(c);
+    }
+  }
+  return colours;
+})();
+
+/** Chebyshev threshold — mirrors the server-side constant. */
+const COLOR_SIMILAR_THRESHOLD = 5;
 
 /** Border styles — only those that render cleanly at all cell sizes */
 const BORDER_STYLES = [
@@ -157,8 +173,7 @@ function buildColorButtons() {
 function buildSwatches() {
   const row = $("color-swatches");
   row.innerHTML = "";
-  for (const color of SWATCH_COLORS) {
-    if (!passesContrastCheck(color)) continue; // safety net: silently skip any that slip through
+  for (const color of PLAYER_PALETTE) {   // palette is pre-filtered; every entry is safe
     const btn = document.createElement("button");
     btn.className = "swatch-btn";
     btn.style.background = color;
@@ -258,6 +273,14 @@ async function joinGame() {
     });
     room.onError((_c: number, msg: string) => console.error("Room error:", msg));
     room.onLeave(() => { room = null; showScreen("connect"); });
+    room.onMessage("colorConflict", () => {
+      const warn = $("color-warn");
+      warn.style.display = "block";
+      warn.textContent   = "Too similar to another player’s colour — try something else.";
+      const me = room?.state?.players?.get(mySessionId);
+      if (me) $<HTMLInputElement>("custom-color").value = getPlayerColor(me);
+      setTimeout(() => { warn.style.display = "none"; warn.textContent = ""; }, 3_000);
+    });
 
     showScreen("lobby");
   } catch (err: any) {
@@ -372,6 +395,7 @@ function updateLobby(state: any) {
     readyBtn.classList.toggle("is-ready", me.ready);
     updateAppearanceSelection(me.playerColor, me.borderStyle);
   }
+  markTakenSwatches(state);
 
   const statusEl = $("lobby-status");
   if (state.lobbyCountdownActive) {
@@ -718,6 +742,29 @@ function passesContrastCheck(hex: string): boolean {
     if (Math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2) < 80) return false;
   }
   return true;
+}
+
+/** True when two player colours differ by ≤ COLOR_SIMILAR_THRESHOLD on every channel (Chebyshev). */
+function colorsTooSimilar(a: string, b: string): boolean {
+  const [r1, g1, b1] = parseHexColor(a);
+  const [r2, g2, b2] = parseHexColor(b);
+  return Math.max(Math.abs(r1 - r2), Math.abs(g1 - g2), Math.abs(b1 - b2)) <= COLOR_SIMILAR_THRESHOLD;
+}
+
+/** Disable / grey-out swatches that fall within the Chebyshev threshold of another player's colour. */
+function markTakenSwatches(state: any) {
+  const myColor      = state.players.get(mySessionId)?.playerColor ?? "";
+  const otherColors: string[] = [];
+  state.players.forEach((p: any, sid: string) => {
+    if (sid !== mySessionId && p.playerColor) otherColors.push(p.playerColor);
+  });
+  document.querySelectorAll<HTMLButtonElement>(".swatch-btn").forEach(btn => {
+    const c     = btn.dataset.color!;
+    const taken = c !== myColor && otherColors.some(oc => colorsTooSimilar(c, oc));
+    btn.classList.toggle("taken", taken);
+    btn.disabled = taken;
+    btn.title    = taken ? "Taken by another player" : c;
+  });
 }
 
 function esc(s: string): string {

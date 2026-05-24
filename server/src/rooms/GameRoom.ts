@@ -12,16 +12,7 @@ const REALTIME_MS             = 200;                   // floor — "real-time" 
 
 const LOBBY_COUNTDOWN_SECONDS = 5;
 
-const DEFAULT_PLAYER_COLORS = [
-  "#9B59B6", // purple
-  "#2C3E50", // dark navy
-  "#4A235A", // dark purple
-  "#000000", // black
-  "#7F8C8D", // grey
-  "#795548", // brown
-  "#6D0000", // dark maroon
-  "#FFFFFF", // white
-];
+const COLOR_SIMILAR_THRESHOLD = 5; // Chebyshev – blocks near-duplicate player colours
 
 const VALID_BORDER_STYLES = ["solid", "double", "rounded"];
 const MIN_PLAYERS             = 2;
@@ -86,6 +77,13 @@ export class GameRoom extends Room<GameRoomState> {
       const player = this.state.players.get(client.sessionId);
       if (!player) return;
       if (typeof data.color === "string" && /^#[0-9a-fA-F]{6}$/.test(data.color)) {
+        let conflict = false;
+        this.state.players.forEach((p: Player, sid: string) => {
+          if (sid !== client.sessionId && p.playerColor
+              && playerColorsTooSimilar(data.color!, p.playerColor))
+            conflict = true;
+        });
+        if (conflict) { client.send("colorConflict"); return; }
         player.playerColor = data.color;
       }
       if (typeof data.borderStyle === "string" && VALID_BORDER_STYLES.includes(data.borderStyle)) {
@@ -141,7 +139,9 @@ export class GameRoom extends Room<GameRoomState> {
     player.playerIndex = this.nextPlayerIndex();
     player.name        = sanitiseName(options?.name, player.playerIndex);
     player.connected   = true;
-    player.playerColor = DEFAULT_PLAYER_COLORS[player.playerIndex % DEFAULT_PLAYER_COLORS.length];
+    const takenColors = [...this.state.players.values()].map(p => p.playerColor).filter(Boolean);
+  player.playerColor = PLAYER_PALETTE.find(c => takenColors.every(t => !playerColorsTooSimilar(c, t)))
+                       ?? PLAYER_PALETTE[player.playerIndex % PLAYER_PALETTE.length];
     player.borderStyle = "solid";
     this.state.players.set(client.sessionId, player);
     console.log(`[join]  ${player.name}  (${this.state.players.size} in lobby)`);
@@ -656,4 +656,61 @@ export class GameRoom extends Room<GameRoomState> {
 
 function sanitiseName(raw: string | undefined, index: number): string {
   return (raw ?? "").trim().slice(0, 20) || `Player ${index + 1}`;
+}
+
+// ─── Player colour utilities ────────────────────────────────────────────────────────────────────────
+
+function hslToHex(h: number, s: number, l: number): string {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if      (h < 60)  { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else              { r = c; b = x; }
+  const hex2 = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, "0");
+  return `#${hex2(r)}${hex2(g)}${hex2(b)}`;
+}
+
+/** Normal grid colours — player colours must stay ≥ 80 Euclidean distance away. */
+const GRID_COLORS_HEX = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"] as const;
+
+function passesGridContrast(hex: string): boolean {
+  const p = (h: string): [number, number, number] => [
+    parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16),
+  ];
+  const [r1, g1, b1] = p(hex);
+  for (const base of GRID_COLORS_HEX) {
+    const [r2, g2, b2] = p(base);
+    if (Math.sqrt((r1-r2)**2 + (g1-g2)**2 + (b1-b2)**2) < 80) return false;
+  }
+  return true;
+}
+
+/** Player palette: 20 hues × 3 lightness rings, pre-filtered to ≥ 80 Euclidean from every grid colour. */
+const PLAYER_PALETTE: ReadonlyArray<string> = (() => {
+  const colours: string[] = [];
+  const hues = Array.from({ length: 20 }, (_, i) => i * 18);
+  for (const [s, l] of [[0.85, 0.45], [0.70, 0.70], [0.80, 0.30]] as [number, number][]) {
+    for (const h of hues) {
+      const c = hslToHex(h, s, l);
+      if (passesGridContrast(c)) colours.push(c);
+    }
+  }
+  return colours;
+})();
+
+/** True when two hex colours differ by ≤ COLOR_SIMILAR_THRESHOLD on every RGB channel (Chebyshev). */
+function playerColorsTooSimilar(a: string, b: string): boolean {
+  const p = (hex: string) => [
+    parseInt(hex.slice(1, 3), 16),
+    parseInt(hex.slice(3, 5), 16),
+    parseInt(hex.slice(5, 7), 16),
+  ] as const;
+  const [r1, g1, b1] = p(a);
+  const [r2, g2, b2] = p(b);
+  return Math.max(Math.abs(r1 - r2), Math.abs(g1 - g2), Math.abs(b1 - b2)) <= COLOR_SIMILAR_THRESHOLD;
 }
