@@ -399,7 +399,7 @@ function updateGame(state: any) {
   scoreEl.innerHTML = "";
   const arr: any[] = [];
   state.players.forEach((p: any) => arr.push(p));
-  arr.sort((a: any, b: any) => b.score - a.score);
+  arr.sort((a: any, b: any) => b.captures - a.captures);
 
   for (const p of arr) {
     const div = document.createElement("div");
@@ -412,7 +412,7 @@ function updateGame(state: any) {
     div.innerHTML =
       `<span class="dot" style="background:${getPlayerColor(p)}"></span>` +
       `<span class="pname">${esc(p.name)}</span>` +
-      `<span class="pts">${p.score}</span>${sub}`;
+      `<span class="pts">${p.captures} captures</span>${sub}`;
     scoreEl.appendChild(div);
   }
 
@@ -453,7 +453,7 @@ function updateGameover(state: any) {
   scoresEl.innerHTML = "";
   const arr: any[] = [];
   state.players.forEach((p: any) => arr.push(p));
-  arr.sort((a: any, b: any) => b.score - a.score);
+  arr.sort((a: any, b: any) => b.captures - a.captures);
 
   const medals = ["🥇", "🥈", "🥉"];
   arr.forEach((p, i) => {
@@ -463,7 +463,7 @@ function updateGameover(state: any) {
       `<span class="medal">${medals[i] ?? (i + 1) + "."}</span>` +
       `<span class="dot" style="background:${getPlayerColor(p)}"></span>` +
       `<span class="pname">${esc(p.name)}</span>` +
-      `<span class="pts">${p.score} cells</span>`;
+      `<span class="pts">${p.captures} captures</span>`;
     scoresEl.appendChild(div);
   });
   $("gameover-note").textContent = "Lobby resets automatically in 10 s";

@@ -5,7 +5,9 @@ import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
 
 const INITIAL_TURN_MS         = 20_000;               // starting turn length (slower ramp-up)
 const PHASE1_MIN_MS           = INITIAL_TURN_MS / 2;  // 10 000 ms — 2× speed cap for Phase 1
-const PHASE2_FACTOR           = Math.pow(0.5, 1 / 3); // half-life of 3 turns ≈ 0.7937
+const PHASE2_SWEET_SPOT_MS    = 2_000;  // decay rate eases below this threshold
+const PHASE2_FAST_FACTOR      = 0.90;   // above sweet spot: −10 %/turn → ~15 turns to 2 s
+const PHASE2_SLOW_FACTOR      = 0.95;   // below sweet spot: −5 %/turn  → ~45 turns to 200 ms
 const REALTIME_MS             = 200;                   // floor — "real-time" threshold
 
 const LOBBY_COUNTDOWN_SECONDS = 5;
@@ -37,6 +39,7 @@ export class Player extends Schema {
   @type("string")  name:           string  = "";
   @type("uint8")   playerIndex:    number  = 0;
   @type("uint16")  score:          number  = 0;
+  @type("uint32")  captures:       number  = 0;
   @type("boolean") ready:          boolean = false;
   @type("boolean") hasSubmitted:   boolean = false;
   @type("int8")    submittedColor: number  = -1;
@@ -212,22 +215,20 @@ export class GameRoom extends Room<GameRoomState> {
     const players = [...this.state.players.values()];
     const n       = players.length;
 
-    const side = Math.ceil(Math.sqrt(CELLS_PER_PLAYER * n));
-    const W = side, H = side;
+    const { W, H, cellColors, starts } = this.buildValidMap(n);
     this.state.gridWidth  = W;
     this.state.gridHeight = H;
 
     this.state.cells.splice(0, this.state.cells.length);
-    for (let i = 0; i < W * H; i++) {
+    for (const colorIndex of cellColors) {
       const c = new Cell();
-      c.colorIndex = Math.floor(Math.random() * 4);
+      c.colorIndex = colorIndex;
       this.state.cells.push(c);
     }
 
-    const starts = this.startPositions(n, W, H);
     players.forEach((p, i) => {
       this.state.cells[starts[i]].ownerId = p.sessionId;
-      p.score = 1; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
+      p.score = 1; p.captures = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
     });
 
     this.state.phase               = "playing";
@@ -244,13 +245,186 @@ export class GameRoom extends Room<GameRoomState> {
     this.beginTurn();
   }
 
-  private startPositions(n: number, W: number, H: number): number[] {
-    const m = (v: number) => Math.floor(v / 2);
-    const pts: [number, number][] = [
-      [0,   0  ], [W-1, H-1], [W-1, 0  ], [0,   H-1],
-      [m(W),0  ], [m(W),H-1], [0,   m(H)], [W-1, m(H)],
-    ];
-    return pts.slice(0, n).map(([col, row]) => row * W + col);
+  // ── Map generation ─────────────────────────────────────────────────────────
+  //
+  // Strategy:
+  //   1. Compute a baseline board side-length from CELLS_PER_PLAYER.
+  //   2. Find starting positions that maximise the minimum pairwise Euclidean
+  //      distance (greedy "farthest-point" heuristic, 30 random seeds).
+  //   3. Generate a random colour grid and simulate greedy flood-fill expansion
+  //      (attacker always picks the colour that captures the most new cells)
+  //      from every starting position for SAFETY_MOVES turns.
+  //   4. If any player's simulated territory reaches another player's start,
+  //      retry with a fresh colour grid (up to 40 attempts).
+  //   5. If all attempts fail at this board size, grow the board by 1 and repeat
+  //      (up to +15 beyond baseline).
+  //
+  // Result: the returned map is guaranteed that no player could capture another
+  // player's starting cell in SAFETY_MOVES moves even with perfect greedy play.
+
+  private buildValidMap(n: number): {
+    W: number; H: number; cellColors: number[]; starts: number[];
+  } {
+    const SAFETY_MOVES   = 4;
+    const BASE_SIDE      = Math.ceil(Math.sqrt(CELLS_PER_PLAYER * n));
+    const MAX_EXTRA      = 15;   // max additional rows/cols beyond baseline
+    const COLOR_ATTEMPTS = 40;   // colour-grid retries per board size
+
+    for (let extra = 0; extra <= MAX_EXTRA; extra++) {
+      const side = BASE_SIDE + extra;
+      const W = side, H = side;
+      const starts = this.spreadStartPositions(n, W, H);
+
+      for (let attempt = 0; attempt < COLOR_ATTEMPTS; attempt++) {
+        const colors = new Uint8Array(W * H);
+        for (let i = 0; i < colors.length; i++) colors[i] = Math.floor(Math.random() * 4);
+
+        if (this.checkSafetyGuarantee(starts, colors, W, H, SAFETY_MOVES)) {
+          console.log(
+            `[map]   ${W}×${H} (size +${extra}), ` +
+            `safety passed on colour attempt ${attempt + 1}`,
+          );
+          return { W, H, cellColors: Array.from(colors), starts };
+        }
+      }
+    }
+
+    // Absolute fallback — largest board, safety not formally guaranteed
+    const side = BASE_SIDE + MAX_EXTRA;
+    const colors = new Uint8Array(side * side);
+    for (let i = 0; i < colors.length; i++) colors[i] = Math.floor(Math.random() * 4);
+    const starts = this.spreadStartPositions(n, side, side);
+    console.warn(`[map]   fallback ${side}×${side} — safety not fully verified`);
+    return { W: side, H: side, cellColors: Array.from(colors), starts };
+  }
+
+  /** Place n starts to maximise the minimum pairwise Euclidean distance.
+   *  Runs the greedy "farthest-point" heuristic from 30 random seeds and
+   *  returns the trial whose minimum pairwise distance is greatest. */
+  private spreadStartPositions(n: number, W: number, H: number): number[] {
+    const posCount = W * H;
+
+    const euclidean = (a: number, b: number): number => {
+      const ax = a % W, ay = Math.floor(a / W);
+      const bx = b % W, by = Math.floor(b / W);
+      return Math.hypot(ax - bx, ay - by);
+    };
+
+    const minPairDist = (pts: number[]): number => {
+      let best = Infinity;
+      for (let i = 0; i < pts.length; i++)
+        for (let j = i + 1; j < pts.length; j++) {
+          const d = euclidean(pts[i], pts[j]);
+          if (d < best) best = d;
+        }
+      return best;
+    };
+
+    const NUM_SEEDS = 30;
+    let bestStarts: number[] = [];
+    let bestMin    = -1;
+
+    for (let seed = 0; seed < NUM_SEEDS; seed++) {
+      const trial: number[]  = [];
+      const inTrial = new Set<number>();
+
+      // Random initial position
+      const first = Math.floor(Math.random() * posCount);
+      trial.push(first);
+      inTrial.add(first);
+
+      // Greedy: each new point maximises its minimum distance to existing starts
+      while (trial.length < n) {
+        let farthestPos  = 0;
+        let farthestDist = -1;
+
+        for (let pos = 0; pos < posCount; pos++) {
+          if (inTrial.has(pos)) continue;
+          let minD = Infinity;
+          for (const s of trial) {
+            const d = euclidean(pos, s);
+            if (d < minD) minD = d;
+          }
+          if (minD > farthestDist) { farthestDist = minD; farthestPos = pos; }
+        }
+
+        trial.push(farthestPos);
+        inTrial.add(farthestPos);
+      }
+
+      const md = minPairDist(trial);
+      if (md > bestMin) { bestMin = md; bestStarts = [...trial]; }
+    }
+
+    return bestStarts;
+  }
+
+  /** Return false if greedy flood-fill from any start can reach another
+   *  player's starting cell within `moves` turns. */
+  private checkSafetyGuarantee(
+    starts: number[], colors: Uint8Array,
+    W: number, H: number, moves: number,
+  ): boolean {
+    for (let i = 0; i < starts.length; i++) {
+      const territory = this.simulateGreedyExpansion(starts[i], colors, W, H, moves);
+      for (let j = 0; j < starts.length; j++) {
+        if (i !== j && territory.has(starts[j])) return false;
+      }
+    }
+    return true;
+  }
+
+  /** Expand `startIdx` greedily for `moves` turns, picking the colour that
+   *  yields the most new captured cells each turn.  Returns the full territory. */
+  private simulateGreedyExpansion(
+    startIdx: number, colors: Uint8Array,
+    W: number, H: number, moves: number,
+  ): Set<number> {
+    const territory = new Set<number>([startIdx]);
+
+    for (let move = 0; move < moves; move++) {
+      let bestCapture: number[] = [];
+
+      for (let color = 0; color < 4; color++) {
+        const captured = this.simulateFloodCapture(territory, colors, W, H, color);
+        if (captured.length > bestCapture.length) bestCapture = captured;
+      }
+
+      if (bestCapture.length === 0) break; // fully surrounded by own territory
+      for (const idx of bestCapture) territory.add(idx);
+    }
+
+    return territory;
+  }
+
+  /** Flood-fill on a raw colour array without mutating any state.
+   *  Identical logic to captureArea but operates on a plain Uint8Array. */
+  private simulateFloodCapture(
+    territory: Set<number>, colors: Uint8Array,
+    W: number, H: number, targetColor: number,
+  ): number[] {
+    const toCapture = new Set<number>();
+    const queue: number[] = [];
+
+    for (const idx of territory) {
+      for (const nb of this.neighbours(idx, W, H)) {
+        if (!territory.has(nb) && colors[nb] === targetColor && !toCapture.has(nb)) {
+          toCapture.add(nb); queue.push(nb);
+        }
+      }
+    }
+
+    let head = 0;
+    while (head < queue.length) {
+      const cur = queue[head++];
+      for (const nb of this.neighbours(cur, W, H)) {
+        if (!territory.has(nb) && colors[nb] === targetColor && !toCapture.has(nb)) {
+          toCapture.add(nb); queue.push(nb);
+        }
+      }
+    }
+
+    return [...toCapture];
   }
 
   // ── Turn management ───────────────────────────────────────────────────────
@@ -294,9 +468,12 @@ export class GameRoom extends Room<GameRoomState> {
     // Captures include cells owned by other players (they are stolen).
     // The first submission to the server wins any contested group.
     for (const { playerId, colorIndex } of this.submissionOrder) {
-      for (const idx of this.captureArea(playerId, colorIndex)) {
+      const captured = this.captureArea(playerId, colorIndex);
+      for (const idx of captured) {
         this.state.cells[idx].ownerId = playerId;
       }
+      const player = this.state.players.get(playerId);
+      if (player) player.captures += captured.length;
     }
 
     // Recount scores
@@ -341,11 +518,16 @@ export class GameRoom extends Room<GameRoomState> {
   // ── Speed progression ─────────────────────────────────────────────────────
   //
   // Phase 1 (unowned cells remain):
-  //   Each turn gets 10 % faster; floor at half the initial duration (7 500 ms).
+  //   −5 %/turn; floor at PHASE1_MIN_MS (10 000 ms).
   //
   // Phase 2 (all cells occupied, game not yet over):
-  //   Half-life of 3 turns (×0.794 per turn); floor at REALTIME_MS (200 ms).
-  //   At 200 ms the `isRealtime` flag is set so the client can show the
+  //   Two-stage decay centred on PHASE2_SWEET_SPOT_MS (2 000 ms):
+  //     • Above 2 s : −10 %/turn (PHASE2_FAST_FACTOR = 0.90)
+  //                   ~15 turns to descend from 10 000 ms → 2 000 ms
+  //     • Below 2 s : −5 %/turn  (PHASE2_SLOW_FACTOR = 0.95)
+  //                   ~45 turns to descend from  2 000 ms → 200 ms
+  //   Total Phase 2 runway: ~60 turns before hitting the 200 ms real-time floor.
+  //   At 200 ms the `isRealtime` flag is set so the client shows the
   //   blinking timer.
 
   private updateTurnSpeed() {
@@ -353,13 +535,16 @@ export class GameRoom extends Room<GameRoomState> {
       // Phase 1
       this.state.turnDurationMs = Math.max(
         PHASE1_MIN_MS,
-        Math.round(this.state.turnDurationMs * 0.95), // 5 % faster per turn (gentler ramp)
+        Math.round(this.state.turnDurationMs * 0.95), // 5 % faster per turn
       );
     } else {
-      // Phase 2
+      // Phase 2 — ease the decay rate once turns drop below the sweet spot
+      const factor = this.state.turnDurationMs > PHASE2_SWEET_SPOT_MS
+        ? PHASE2_FAST_FACTOR
+        : PHASE2_SLOW_FACTOR;
       this.state.turnDurationMs = Math.max(
         REALTIME_MS,
-        Math.round(this.state.turnDurationMs * PHASE2_FACTOR),
+        Math.round(this.state.turnDurationMs * factor),
       );
       if (this.state.turnDurationMs <= REALTIME_MS) {
         this.state.isRealtime = true;
@@ -441,7 +626,7 @@ export class GameRoom extends Room<GameRoomState> {
     for (const id of toRemove) this.state.players.delete(id);
 
     this.state.players.forEach((p: Player) => {
-      p.score = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
+      p.score = 0; p.captures = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
     });
 
     this.state.cells.splice(0, this.state.cells.length);
