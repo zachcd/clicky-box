@@ -47,8 +47,16 @@ const PLAYER_PALETTE: ReadonlyArray<string> = (() => {
   return colours;
 })();
 
-/** Chebyshev threshold — mirrors the server-side constant. */
-const COLOR_SIMILAR_THRESHOLD = 5;
+/**
+ * Chebyshev colour-exclusion radius that scales with current player count — mirrors server logic.
+ * Fewer players → larger band (forces clearly distinct colours).
+ * More  players → smaller band (opens up the palette).
+ */
+function similarityThreshold(playerCount: number): number {
+  const MAX_T = 80, MIN_T = 5, MAX_P = 8;
+  const t = Math.max(0, Math.min(1, (playerCount - 2) / (MAX_P - 2)));
+  return Math.round(MAX_T + (MIN_T - MAX_T) * t);
+}
 
 /** Border styles — only those that render cleanly at all cell sizes */
 const BORDER_STYLES = [
@@ -744,23 +752,24 @@ function passesContrastCheck(hex: string): boolean {
   return true;
 }
 
-/** True when two player colours differ by ≤ COLOR_SIMILAR_THRESHOLD on every channel (Chebyshev). */
-function colorsTooSimilar(a: string, b: string): boolean {
+/** True when two player colours are within `threshold` on every RGB channel (Chebyshev). */
+function colorsTooSimilar(a: string, b: string, threshold: number): boolean {
   const [r1, g1, b1] = parseHexColor(a);
   const [r2, g2, b2] = parseHexColor(b);
-  return Math.max(Math.abs(r1 - r2), Math.abs(g1 - g2), Math.abs(b1 - b2)) <= COLOR_SIMILAR_THRESHOLD;
+  return Math.max(Math.abs(r1 - r2), Math.abs(g1 - g2), Math.abs(b1 - b2)) <= threshold;
 }
 
-/** Disable / grey-out swatches that fall within the Chebyshev threshold of another player's colour. */
+/** Disable / grey-out swatches that fall within the player-count-scaled threshold of another player's colour. */
 function markTakenSwatches(state: any) {
   const myColor      = state.players.get(mySessionId)?.playerColor ?? "";
   const otherColors: string[] = [];
   state.players.forEach((p: any, sid: string) => {
     if (sid !== mySessionId && p.playerColor) otherColors.push(p.playerColor);
   });
+  const threshold = similarityThreshold(state.players.size);
   document.querySelectorAll<HTMLButtonElement>(".swatch-btn").forEach(btn => {
     const c     = btn.dataset.color!;
-    const taken = c !== myColor && otherColors.some(oc => colorsTooSimilar(c, oc));
+    const taken = c !== myColor && otherColors.some(oc => colorsTooSimilar(c, oc, threshold));
     btn.classList.toggle("taken", taken);
     btn.disabled = taken;
     btn.title    = taken ? "Taken by another player" : c;

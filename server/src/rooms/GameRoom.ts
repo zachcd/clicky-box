@@ -12,7 +12,7 @@ const REALTIME_MS             = 200;                   // floor — "real-time" 
 
 const LOBBY_COUNTDOWN_SECONDS = 5;
 
-const COLOR_SIMILAR_THRESHOLD = 5; // Chebyshev – blocks near-duplicate player colours
+const EARLY_COMPLETION_TURNS  = 10;  // early end-of-turn allowed only within this many turns
 
 const VALID_BORDER_STYLES = ["solid", "double", "rounded"];
 const MIN_PLAYERS             = 2;
@@ -59,7 +59,7 @@ export class GameRoomState extends Schema {
 export class GameRoom extends Room<GameRoomState> {
   maxClients = 8;
 
-  private submissionOrder:      Array<{ playerId: string; colorIndex: number }> = [];
+  private submissionOrder:      Array<{ playerId: string; colorIndex: number; receivedAt: number }> = [];
   private submittedThisTurn:    Set<string>                                     = new Set();
   private turnEnded:            boolean                                         = false;
   private turnStartTime:        number                                          = 0;
@@ -78,9 +78,10 @@ export class GameRoom extends Room<GameRoomState> {
       if (!player) return;
       if (typeof data.color === "string" && /^#[0-9a-fA-F]{6}$/.test(data.color)) {
         let conflict = false;
+        const threshold = similarityThreshold(this.state.players.size);
         this.state.players.forEach((p: Player, sid: string) => {
           if (sid !== client.sessionId && p.playerColor
-              && playerColorsTooSimilar(data.color!, p.playerColor))
+              && playerColorsTooSimilar(data.color!, p.playerColor, threshold))
             conflict = true;
         });
         if (conflict) { client.send("colorConflict"); return; }
@@ -116,11 +117,15 @@ export class GameRoom extends Room<GameRoomState> {
       if (typeof ci !== "number" || ci < 0 || ci > 3) return;
 
       this.submittedThisTurn.add(client.sessionId);
-      this.submissionOrder.push({ playerId: client.sessionId, colorIndex: ci });
+      this.submissionOrder.push({ playerId: client.sessionId, colorIndex: ci, receivedAt: Date.now() });
       player.hasSubmitted   = true;
       player.submittedColor = ci;
 
-      this.checkAllSubmitted();
+      // Allow skipping the remainder of the timer only in the early game.
+      if (this.state.currentTurn < EARLY_COMPLETION_TURNS) {
+        const active = this.activePlayers();
+        if (active.length > 0 && active.every(p => p.hasSubmitted)) this.endTurn();
+      }
     });
 
     this.onMessage("playAgain", (client: Client) => {
@@ -139,9 +144,10 @@ export class GameRoom extends Room<GameRoomState> {
     player.playerIndex = this.nextPlayerIndex();
     player.name        = sanitiseName(options?.name, player.playerIndex);
     player.connected   = true;
-    const takenColors = [...this.state.players.values()].map(p => p.playerColor).filter(Boolean);
-  player.playerColor = PLAYER_PALETTE.find(c => takenColors.every(t => !playerColorsTooSimilar(c, t)))
-                       ?? PLAYER_PALETTE[player.playerIndex % PLAYER_PALETTE.length];
+    const takenColors    = [...this.state.players.values()].map(p => p.playerColor).filter(Boolean);
+  const joinThreshold  = similarityThreshold(this.state.players.size + 1); // +1 = this player
+  player.playerColor   = PLAYER_PALETTE.find(c => takenColors.every(t => !playerColorsTooSimilar(c, t, joinThreshold)))
+                         ?? PLAYER_PALETTE[player.playerIndex % PLAYER_PALETTE.length];
     player.borderStyle = "solid";
     this.state.players.set(client.sessionId, player);
     console.log(`[join]  ${player.name}  (${this.state.players.size} in lobby)`);
@@ -155,7 +161,6 @@ export class GameRoom extends Room<GameRoomState> {
       this.checkLobbyReady();
     } else if (this.state.phase === "playing") {
       player.connected = false;
-      this.checkAllSubmitted();
     } else {
       this.state.players.delete(client.sessionId);
     }
@@ -448,11 +453,6 @@ export class GameRoom extends Room<GameRoomState> {
     }, 50); // 20 Hz — snappy at high speeds
   }
 
-  private checkAllSubmitted() {
-    const active = this.activePlayers();
-    if (active.length > 0 && active.every(p => p.hasSubmitted)) this.endTurn();
-  }
-
   private endTurn() {
     if (this.turnEnded) return;
     this.turnEnded = true;
@@ -465,8 +465,9 @@ export class GameRoom extends Room<GameRoomState> {
 
     // ── Process submissions in arrival order ───────────────────────────────
     //
-    // Captures include cells owned by other players (they are stolen).
-    // The first submission to the server wins any contested group.
+    // Sorted ascending by receivedAt: the LAST player to submit a colour
+    // wins any contested group — the most-recent input always prevails.
+    this.submissionOrder.sort((a, b) => a.receivedAt - b.receivedAt);
     for (const { playerId, colorIndex } of this.submissionOrder) {
       const captured = this.captureArea(playerId, colorIndex);
       for (const idx of captured) {
@@ -518,7 +519,8 @@ export class GameRoom extends Room<GameRoomState> {
   // ── Speed progression ─────────────────────────────────────────────────────
   //
   // Phase 1 (unowned cells remain):
-  //   −5 %/turn; floor at PHASE1_MIN_MS (10 000 ms).
+  //   −12 %/turn; floor at PHASE1_MIN_MS (10 000 ms).
+  //   Reaches floor in ~6 turns (was ~13 with the former −5 %/turn).
   //
   // Phase 2 (all cells occupied, game not yet over):
   //   Two-stage decay centred on PHASE2_SWEET_SPOT_MS (2 000 ms):
@@ -535,7 +537,7 @@ export class GameRoom extends Room<GameRoomState> {
       // Phase 1
       this.state.turnDurationMs = Math.max(
         PHASE1_MIN_MS,
-        Math.round(this.state.turnDurationMs * 0.95), // 5 % faster per turn
+        Math.round(this.state.turnDurationMs * 0.88), // 12 % faster per turn
       );
     } else {
       // Phase 2 — ease the decay rate once turns drop below the sweet spot
@@ -703,8 +705,22 @@ const PLAYER_PALETTE: ReadonlyArray<string> = (() => {
   return colours;
 })();
 
-/** True when two hex colours differ by ≤ COLOR_SIMILAR_THRESHOLD on every RGB channel (Chebyshev). */
-function playerColorsTooSimilar(a: string, b: string): boolean {
+/**
+ * Chebyshev colour-exclusion radius that scales with current player count.
+ * Fewer players → larger band (forces clearly distinct colours).
+ * More  players → smaller band (opens up the palette).
+ *
+ *   2 players → threshold = 80   (same as grid-contrast floor)
+ *   8 players → threshold =  5   (near-duplicate block only)
+ *   counts in-between interpolate linearly.
+ */
+function similarityThreshold(playerCount: number): number {
+  const MAX_T = 80, MIN_T = 5, MAX_P = 8;
+  const t = Math.max(0, Math.min(1, (playerCount - 2) / (MAX_P - 2)));
+  return Math.round(MAX_T + (MIN_T - MAX_T) * t);
+}
+
+function playerColorsTooSimilar(a: string, b: string, threshold: number): boolean {
   const p = (hex: string) => [
     parseInt(hex.slice(1, 3), 16),
     parseInt(hex.slice(3, 5), 16),
@@ -712,5 +728,5 @@ function playerColorsTooSimilar(a: string, b: string): boolean {
   ] as const;
   const [r1, g1, b1] = p(a);
   const [r2, g2, b2] = p(b);
-  return Math.max(Math.abs(r1 - r2), Math.abs(g1 - g2), Math.abs(b1 - b2)) <= COLOR_SIMILAR_THRESHOLD;
+  return Math.max(Math.abs(r1 - r2), Math.abs(g1 - g2), Math.abs(b1 - b2)) <= threshold;
 }
