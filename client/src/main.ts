@@ -130,6 +130,7 @@ let client: Client | null = null;
 let room:   any           = null;
 let mySessionId           = "";
 let prevPhase             = "";
+let scoreHistoryData: { totalCells: number; players: Array<{ name: string; color: string; scores: number[] }> } | null = null;
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
@@ -289,6 +290,10 @@ async function joinGame() {
       if (me) $<HTMLInputElement>("custom-color").value = getPlayerColor(me);
       setTimeout(() => { warn.style.display = "none"; warn.textContent = ""; }, 3_000);
     });
+    room.onMessage("scoreHistory", (data: typeof scoreHistoryData) => {
+      scoreHistoryData = data;
+      renderScoreChart();
+    });
 
     showScreen("lobby");
   } catch (err: any) {
@@ -366,6 +371,7 @@ function updateUI(state: any) {
       showScreen("game");
       localHasSubmitted = false;  // fresh game — clear any leftover lock
       lastTurnSeen      = -1;
+      scoreHistoryData  = null;
       setColorBtnsEnabled(true);
     }
     else if (phase === "gameover") showScreen("gameover");
@@ -499,9 +505,70 @@ function updateGameover(state: any) {
     scoresEl.appendChild(div);
   });
   $("gameover-note").textContent = "Lobby resets automatically in 10 s";
+  renderScoreChart();
 }
 
 // ─── Canvas render loop ───────────────────────────────────────────────────────
+
+function renderScoreChart() {
+  const canvas = $<HTMLCanvasElement>("score-chart");
+  if (!canvas || !scoreHistoryData) return;
+
+  const { totalCells, players } = scoreHistoryData;
+  if (!players.length || totalCells === 0) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const W   = canvas.offsetWidth  || 380;
+  const H   = canvas.offsetHeight || 160;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+
+  const ctx = canvas.getContext("2d")!;
+  ctx.scale(dpr, dpr);
+
+  const PAD = { top: 12, right: 16, bottom: 26, left: 40 };
+  const cW  = W - PAD.left - PAD.right;
+  const cH  = H - PAD.top  - PAD.bottom;
+  const maxTurns = Math.max(...players.map(p => p.scores.length), 2);
+
+  // Background
+  ctx.fillStyle = "#0a0a14";
+  ctx.fillRect(0, 0, W, H);
+
+  // Horizontal grid lines + Y-axis labels
+  ctx.font         = "9px system-ui, sans-serif";
+  ctx.textAlign    = "right";
+  ctx.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD.top + cH * (1 - i / 4);
+    ctx.strokeStyle = "rgba(255,255,255,0.07)";
+    ctx.lineWidth   = 1;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + cW, y); ctx.stroke();
+    ctx.fillStyle   = "rgba(255,255,255,0.30)";
+    ctx.fillText(String(Math.round(totalCells * i / 4)), PAD.left - 5, y);
+  }
+
+  // X-axis label
+  ctx.textAlign    = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle    = "rgba(255,255,255,0.25)";
+  ctx.fillText("turn", PAD.left + cW / 2, H - 4);
+
+  // One line per player, coloured with their player colour
+  for (const p of players) {
+    if (p.scores.length < 2) continue;
+    ctx.strokeStyle = p.color || "#888888";
+    ctx.lineWidth   = 2;
+    ctx.lineJoin    = "round";
+    ctx.beginPath();
+    p.scores.forEach((score, i) => {
+      const x = PAD.left + (i / (maxTurns - 1)) * cW;
+      const y = PAD.top  + cH * (1 - score / totalCells);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+}
 
 function renderLoop() {
   const state = room?.state as any;

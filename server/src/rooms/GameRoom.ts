@@ -64,6 +64,7 @@ export class GameRoom extends Room<GameRoomState> {
   private turnEnded:            boolean                                         = false;
   private turnStartTime:        number                                          = 0;
   private allOccupied:          boolean                                         = false; // Phase 2 flag
+  private scoreHistory:         Map<string, number[]>                          = new Map();
   private turnIntervalRef:      ReturnType<typeof setInterval> | null           = null;
   private countdownIntervalRef: ReturnType<typeof setInterval> | null           = null;
 
@@ -235,6 +236,9 @@ export class GameRoom extends Room<GameRoomState> {
       this.state.cells[starts[i]].ownerId = p.sessionId;
       p.score = 1; p.captures = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
     });
+
+    this.scoreHistory = new Map();
+    players.forEach(p => this.scoreHistory.set(p.sessionId, [1])); // seed with starting score
 
     this.state.phase               = "playing";
     this.state.currentTurn         = 0;
@@ -487,6 +491,11 @@ export class GameRoom extends Room<GameRoomState> {
       p.score = counts.get(id) ?? 0;
     });
 
+    // Snapshot scores for the end-of-game chart
+    this.state.players.forEach((p: Player, id: string) => {
+      this.scoreHistory.get(id)?.push(p.score);
+    });
+
     this.state.currentTurn++;
 
     // ── Phase 2 detection ─────────────────────────────────────────────────
@@ -617,6 +626,17 @@ export class GameRoom extends Room<GameRoomState> {
     this.state.winnerId     = winnerId;
     const w = this.state.players.get(winnerId);
     console.log(`[game]  over — winner: ${w?.name ?? "?"} (${w?.score ?? 0} cells)`);
+
+    // Broadcast the per-turn score history so the client can draw the chart
+    const histPlayers: Array<{ name: string; color: string; scores: number[] }> = [];
+    this.state.players.forEach((p: Player, sid: string) => {
+      histPlayers.push({ name: p.name, color: p.playerColor, scores: this.scoreHistory.get(sid) ?? [] });
+    });
+    this.broadcast("scoreHistory", {
+      totalCells: this.state.gridWidth * this.state.gridHeight,
+      players:    histPlayers,
+    });
+
     setTimeout(() => this.resetToLobby(), 10_000);
   }
 
@@ -630,6 +650,7 @@ export class GameRoom extends Room<GameRoomState> {
     this.state.players.forEach((p: Player) => {
       p.score = 0; p.captures = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
     });
+    this.scoreHistory = new Map();
 
     this.state.cells.splice(0, this.state.cells.length);
     this.state.gridWidth           = 0;
