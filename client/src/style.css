@@ -230,6 +230,58 @@ input[type="text"]:focus { border-color: var(--accent); }
   box-shadow: 0 0 0 1.5px rgba(255,255,255,.2);
 }
 
+/* ── Game layout ─────────────────────────────────────────────────────────── */
+.screen-game { position: relative; }
+
+#game-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* canvas-wrap stays flex-1 (unchanged behaviour) */
+
+/* ── Right sidebar ────────────────────────────────────────────────────────── */
+#sidebar {
+  flex-shrink: 0;
+  width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0;
+  background: linear-gradient(180deg, rgba(20,20,38,0.96) 0%, rgba(13,13,26,0.96) 100%);
+  border-left: 1px solid rgba(255,255,255,0.06);
+  backdrop-filter: blur(6px);
+  transition: width .25s ease, padding .25s ease;
+}
+
+@media (min-width: 680px) {
+  #sidebar {
+    width: 168px;
+    padding: 10px;
+  }
+  /* Compact HUD score row hidden on desktop — sidebar takes over */
+  #score-board { display: none; }
+}
+
+.sb-title {
+  font-size: .6rem; font-weight: 700; color: var(--dim);
+  text-transform: uppercase; letter-spacing: .7px; white-space: nowrap;
+}
+.sb-chart-label { margin-top: auto; }
+
+.sb-entry {
+  display: flex; align-items: center; gap: 5px;
+  font-size: .78rem; overflow: hidden;
+}
+.sb-entry.me   { font-weight: 700; }
+.sb-entry .pname  { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-entry .sb-score { color: var(--dim); font-size: .7rem; white-space: nowrap; }
+
+.live-chart { width: 100%; flex: 1; min-height: 70px; border-radius: 4px; display: block; }
+
 /* ── Canvas ──────────────────────────────────────────────────────────────── */
 #canvas-wrap { flex: 1; overflow: hidden; position: relative; background: var(--bg); }
 #grid-canvas { display: block; width: 100%; height: 100%; }

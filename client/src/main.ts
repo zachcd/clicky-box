@@ -74,6 +74,13 @@ let colorblindMode = localStorage.getItem("cb") === "1";
 // Grid render params — written every frame, read by the click handler
 const gridParams = { offX: 0, offY: 0, cellSize: 1, W: 0, H: 0, GAP: 10 };
 
+// Start-of-game zoom animation — triggered when phase transitions to "playing"
+let startAnimState: { startTime: number; cellIdx: number } | null = null;
+
+// Live score history (client-side, one snapshot per turn)
+const liveScoreHistory = new Map<string, number[]>();
+let   liveLastTurn     = -1;
+
 // ─── Capture animations ───────────────────────────────────────────────────────
 
 interface CaptureAnim { startTime: number; color: string; }
@@ -372,6 +379,17 @@ function updateUI(state: any) {
       localHasSubmitted = false;  // fresh game — clear any leftover lock
       lastTurnSeen      = -1;
       scoreHistoryData  = null;
+      liveScoreHistory.clear();
+      liveLastTurn = -1;
+      // Find this player's starting cell and trigger the zoom-out animation
+      if (state?.cells) {
+        for (let i = 0; i < state.cells.length; i++) {
+          if (state.cells[i].ownerId === mySessionId) {
+            startAnimState = { startTime: performance.now(), cellIdx: i };
+            break;
+          }
+        }
+      }
       setColorBtnsEnabled(true);
     }
     else if (phase === "gameover") showScreen("gameover");
@@ -425,6 +443,9 @@ function updateLobby(state: any) {
 // ─── Game HUD ─────────────────────────────────────────────────────────────────
 
 function updateGame(state: any) {
+  snapshotScores(state);
+  updateSidebar(state);
+
   $("turn-counter").textContent = `Turn ${state.currentTurn + 1}`;
 
   const pct  = Math.max(0, Math.min(1, state.turnTimeLeft)) * 100;
@@ -477,6 +498,80 @@ function updateGame(state: any) {
   document.querySelectorAll<HTMLButtonElement>(".color-btn").forEach((btn, i) => {
     btn.style.background = colors[i];
   });
+}
+
+function snapshotScores(state: any) {
+  if (state.phase !== "playing" || state.currentTurn === liveLastTurn) return;
+  liveLastTurn = state.currentTurn;
+  state.players.forEach((p: any, sid: string) => {
+    if (!liveScoreHistory.has(sid)) liveScoreHistory.set(sid, []);
+    liveScoreHistory.get(sid)!.push(p.score as number);
+  });
+}
+
+function updateSidebar(state: any) {
+  const sidebar = $("sidebar");
+  const scoresEl = $("sidebar-scores");
+  if (!sidebar || !scoresEl) return;
+
+  scoresEl.innerHTML = "";
+  const arr: any[] = [];
+  state.players.forEach((p: any) => arr.push(p));
+  arr.sort((a: any, b: any) => b.score - a.score);
+  for (const p of arr) {
+    const div = document.createElement("div");
+    div.className = `sb-entry${p.sessionId === mySessionId ? " me" : ""}`;
+    div.innerHTML =
+      `<span class="dot" style="background:${getPlayerColor(p)}"></span>` +
+      `<span class="pname">${esc(p.name)}</span>` +
+      `<span class="sb-score">${p.score}</span>`;
+    scoresEl.appendChild(div);
+  }
+  renderLiveChart(state);
+}
+
+function renderLiveChart(state: any) {
+  const canvas = $("live-chart") as HTMLCanvasElement | null;
+  if (!canvas) return;
+  const totalCells = (state.gridWidth as number) * (state.gridHeight as number);
+  if (!totalCells) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const W   = canvas.offsetWidth  || 150;
+  const H   = canvas.offsetHeight || 100;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  const ctx2 = canvas.getContext("2d")!;
+  ctx2.scale(dpr, dpr);
+
+  const PAD = { top: 4, right: 4, bottom: 4, left: 4 };
+  const cW  = W - PAD.left - PAD.right;
+  const cH  = H - PAD.top  - PAD.bottom;
+
+  ctx2.fillStyle = "rgba(0,0,0,0.35)";
+  ctx2.fillRect(0, 0, W, H);
+
+  const entries: Array<{ color: string; scores: number[] }> = [];
+  state.players.forEach((p: any, sid: string) => {
+    const scores = liveScoreHistory.get(sid);
+    if (scores?.length) entries.push({ color: getPlayerColor(p), scores });
+  });
+  if (!entries.length) return;
+
+  const maxLen = Math.max(...entries.map(e => e.scores.length), 2);
+  for (const e of entries) {
+    if (e.scores.length < 2) continue;
+    ctx2.strokeStyle = e.color;
+    ctx2.lineWidth   = 1.5;
+    ctx2.lineJoin    = "round";
+    ctx2.beginPath();
+    e.scores.forEach((score, i) => {
+      const x = PAD.left + (i / (maxLen - 1)) * cW;
+      const y = PAD.top  + cH * (1 - score / totalCells);
+      i === 0 ? ctx2.moveTo(x, y) : ctx2.lineTo(x, y);
+    });
+    ctx2.stroke();
+  }
 }
 
 // ─── Game over ────────────────────────────────────────────────────────────────
@@ -604,6 +699,29 @@ function renderGrid(state: any) {
 
   ctx.fillStyle = "#0f0f1a";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Zoom-out start animation: find player's cell, scale 6× → 1× over 1.8 s
+  const animNow = performance.now();
+  let   zoomed  = false;
+  if (startAnimState) {
+    const t = Math.min(1, (animNow - startAnimState.startTime) / 1800);
+    if (t < 1) {
+      const ease  = 1 - Math.pow(1 - t, 2.5);
+      const scale = 6 - 5 * ease;                           // 6× → 1×
+      const col   = startAnimState.cellIdx % W;
+      const row   = Math.floor(startAnimState.cellIdx / W);
+      const cx    = offX + GAP + col * cellSize + (cellSize - GAP) / 2;
+      const cy    = offY + GAP + row * cellSize + (cellSize - GAP) / 2;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(scale, scale);
+      ctx.translate(-cx, -cy);
+      zoomed = true;
+    } else {
+      startAnimState = null;
+    }
+  }
+
   ctx.fillStyle = "#050509";          // very dark gap / grid-line colour
   ctx.fillRect(offX, offY, totalW, totalH);
 
@@ -681,6 +799,27 @@ function renderGrid(state: any) {
 
   // Capture animations drawn on top
   renderCaptureAnims(W);
+
+  // Pulsing "you start here" ring — shown for the first 2.5 s of the game
+  if (startAnimState) {
+    const t     = Math.min(1, (animNow - startAnimState.startTime) / 2500);
+    const pulse = Math.abs(Math.sin(t * Math.PI * 9)) * Math.pow(1 - t, 0.7);
+    if (pulse > 0.02) {
+      const col = startAnimState.cellIdx % W;
+      const row = Math.floor(startAnimState.cellIdx / W);
+      const x   = offX + GAP + col * cellSize - 3;
+      const y   = offY + GAP + row * cellSize - 3;
+      const sz  = cellSize - GAP + 6;
+      ctx.save();
+      ctx.strokeStyle = `rgba(255,255,255,${(pulse * 0.9).toFixed(3)})`;
+      ctx.lineWidth   = Math.max(2, cellSize * 0.07);
+      ctx.setLineDash([]);
+      ctx.beginPath(); roundedRectPath(x, y, sz, sz, 5); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  if (zoomed) ctx.restore();
 }
 
 function roundedRectPath(x: number, y: number, w: number, h: number, r: number) {

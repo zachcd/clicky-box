@@ -68,8 +68,18 @@
       </div>
 
       <!-- Click any cell to select that colour -->
-      <div id="canvas-wrap">
-        <canvas id="grid-canvas"></canvas>
+      <div id="game-body">
+        <div id="canvas-wrap">
+          <canvas id="grid-canvas"></canvas>
+        </div>
+
+        <!-- Right sidebar: floating score panel + live chart (desktop) -->
+        <div id="sidebar">
+          <span class="sb-title">Players</span>
+          <div id="sidebar-scores"></div>
+          <span class="sb-title sb-chart-label">Territory</span>
+          <canvas id="live-chart" class="live-chart"></canvas>
+        </div>
       </div>
 
       <!-- Colour picker — button click or Q / W / E / R -->
