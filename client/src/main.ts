@@ -487,6 +487,7 @@ let client: Client | null = null;
 let room: any = null;
 let mySessionId = "";
 let prevPhase = "";
+const myVoteKicks = new Set<string>(); // session IDs this client has voted to kick
 let scoreHistoryData: {
   totalCells: number;
   players: Array<{ name: string; color: string; scores: number[] }>;
@@ -673,6 +674,7 @@ async function joinGame() {
     room = await client.joinOrCreate("game", { name, lobbyId: lobbySlug });
     mySessionId = room.sessionId as string;
     prevPhase = "";
+    myVoteKicks.clear();
 
     // Ensure the URL reflects the actual slug we joined
     history.replaceState(null, "", getPathForSlug(lobbySlug));
@@ -687,8 +689,17 @@ async function joinGame() {
     );
     room.onLeave(() => {
       room = null;
+      myVoteKicks.clear();
       stopPingProbe();
       showScreen("connect");
+    });
+
+    room.onMessage("kicked", () => {
+      room = null;
+      myVoteKicks.clear();
+      stopPingProbe();
+      showScreen("connect");
+      $("connect-error").textContent = "You were removed from the lobby by a vote kick.";
     });
     room.onMessage("colorConflict", () => {
       const warn = $("color-warn");
@@ -803,6 +814,7 @@ function updateUI(state: any) {
       scoreHistoryData = null;
       liveScoreHistory.clear();
       liveLastTurn = -1;
+      myVoteKicks.clear();
       floatingTexts.length = 0;
       currentTurnSubmissions.clear();
       turnGainedCells.clear();
@@ -833,6 +845,10 @@ function updateLobby(state: any) {
   const listEl = $("player-list");
   listEl.innerHTML = "";
 
+  const readyCount = [...state.players.values()].filter((p: any) => p.ready).length;
+  const threshold  = Math.max(2, Math.ceil((state.players.size - 1) / 2));
+  const kickActive = readyCount >= 2;
+
   state.players.forEach((p: any, sid: string) => {
     const li = document.createElement("li");
     li.className = `player-entry${sid === mySessionId ? " me" : ""}`;
@@ -844,6 +860,22 @@ function updateLobby(state: any) {
       (p.ready
         ? `<span class="badge ready">READY</span>`
         : `<span class="badge waiting">waiting</span>`);
+
+    // Vote-kick button: shown for non-me, non-ready, grace-period-passed players
+    // when at least 2 players are already ready
+    if (sid !== mySessionId && !p.ready && p.kickEligible && kickActive) {
+      const voted   = myVoteKicks.has(sid);
+      const kickBtn = document.createElement("button");
+      kickBtn.className = `kick-btn${voted ? " voted" : ""}`;
+      kickBtn.textContent = `Kick ${p.voteKickCount}/${threshold}`;
+      kickBtn.title = voted ? "Retract vote" : "Vote to kick";
+      kickBtn.addEventListener("click", () => {
+        if (!room) return;
+        myVoteKicks.has(sid) ? myVoteKicks.delete(sid) : myVoteKicks.add(sid);
+        room.send("voteKick", { targetId: sid });
+      });
+      li.appendChild(kickBtn);
+    }
     listEl.appendChild(li);
   });
 

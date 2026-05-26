@@ -26,6 +26,7 @@ const PHASE2_SLOW_FACTOR_MAX  = 0.99;   // Phase 2 below sweet-spot: slowest dec
 // neutral ≈ 0.945, matching former PHASE2_SLOW_FACTOR = 0.95
 
 const LOBBY_COUNTDOWN_SECONDS = 5;
+const VOTE_KICK_GRACE_MS      = 30_000; // 30 s after joining before a player can be vote-kicked
 
 // Early turn completion is phase-based — see selectColor handler.
 
@@ -52,6 +53,8 @@ export class Player extends Schema {
   @type("boolean") connected:      boolean = true;
   @type("string")  playerColor:    string  = "";   // hex — "" falls back to default on client
   @type("string")  borderStyle:    string  = "solid";
+  @type("boolean") kickEligible:  boolean = false;  // grace period has elapsed
+  @type("uint8")   voteKickCount: number  = 0;       // votes currently cast to kick this player
 }
 
 export class GameRoomState extends Schema {
@@ -87,6 +90,8 @@ export class GameRoom extends Room<GameRoomState> {
   // (0 = everyone submitted instantly, 1 = last submission arrived at the very end).
   // Defaults to 0.5 (neutral) so the first turn uses the baseline decay rate.
   private lastTurnSlowFraction: number                                          = 0.5;
+  private kickGraceTimers:      Map<string, ReturnType<typeof setTimeout>>       = new Map();
+  private voteKickVotes:        Map<string, Set<string>>                          = new Map(); // targetId → Set<voterId>
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -125,7 +130,53 @@ export class GameRoom extends Room<GameRoomState> {
       const player = this.state.players.get(client.sessionId);
       if (player && this.state.phase === "lobby") {
         player.ready = !player.ready;
+        if (player.ready) {
+          // Readying up cancels any active vote against this player
+          this.voteKickVotes.delete(client.sessionId);
+          player.voteKickCount = 0;
+        }
         this.checkLobbyReady();
+      }
+    });
+
+    this.onMessage("voteKick", (client: Client, data: { targetId: string }) => {
+      if (this.state.phase !== "lobby") return;
+      const targetId = data?.targetId;
+      if (typeof targetId !== "string" || targetId === client.sessionId) return;
+
+      const target = this.state.players.get(targetId);
+      if (!target)              return;   // player not found
+      if (!target.kickEligible) return;   // still within grace period
+      if (target.ready)         return;   // can't kick a readied player
+
+      const readyCount = [...this.state.players.values()].filter(p => p.ready).length;
+      if (readyCount < 2)       return;   // activation condition not met
+
+      if (!this.voteKickVotes.has(targetId)) this.voteKickVotes.set(targetId, new Set());
+      const votes = this.voteKickVotes.get(targetId)!;
+
+      // Toggle: clicking again retracts the vote
+      if (votes.has(client.sessionId)) votes.delete(client.sessionId);
+      else                              votes.add(client.sessionId);
+      target.voteKickCount = votes.size;
+
+      const threshold = Math.max(2, Math.ceil((this.state.players.size - 1) / 2));
+      if (votes.size < threshold) return;
+
+      // ─ Threshold reached: execute the kick ──────────────────────────────────
+      const kickedName = target.name;
+      // Delete from state first so onLeave becomes a no-op for this player
+      this.voteKickVotes.delete(targetId);
+      this.voteKickVotes.forEach(v => v.delete(targetId)); // retract votes they cast
+      const gt = this.kickGraceTimers.get(targetId);
+      if (gt) { clearTimeout(gt); this.kickGraceTimers.delete(targetId); }
+      this.state.players.delete(targetId);
+      this.checkLobbyReady();
+      console.log(`[vote]  ${kickedName} removed by vote kick`);
+      const kickClient = this.clients.find(c => c.sessionId === targetId);
+      if (kickClient) {
+        kickClient.send("kicked");
+        setTimeout(() => kickClient.leave(4001), 100);
       }
     });
 
@@ -180,19 +231,37 @@ export class GameRoom extends Room<GameRoomState> {
                          ?? PLAYER_PALETTE[player.playerIndex % PLAYER_PALETTE.length];
     player.borderStyle = "solid";
     this.state.players.set(client.sessionId, player);
+    // Start the grace-period countdown; player can't be vote-kicked until it elapses
+    const graceTimer = setTimeout(() => {
+      const p = this.state.players.get(client.sessionId);
+      if (p) p.kickEligible = true;
+      this.kickGraceTimers.delete(client.sessionId);
+    }, VOTE_KICK_GRACE_MS);
+    this.kickGraceTimers.set(client.sessionId, graceTimer);
     console.log(`[join]  ${player.name}  (${this.state.players.size} in lobby)`);
   }
 
   onLeave(client: Client, _consented: boolean) {
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
+    const sid = client.sessionId;
+    // Clean up any votekick state for this player
+    const gt = this.kickGraceTimers.get(sid);
+    if (gt) { clearTimeout(gt); this.kickGraceTimers.delete(sid); }
+    this.voteKickVotes.forEach((voters, targetId) => {
+      if (voters.delete(sid)) {
+        const t = this.state.players.get(targetId);
+        if (t) t.voteKickCount = voters.size;
+      }
+    });
+    this.voteKickVotes.delete(sid);
     if (this.state.phase === "lobby") {
-      this.state.players.delete(client.sessionId);
+      this.state.players.delete(sid);
       this.checkLobbyReady();
     } else if (this.state.phase === "playing") {
       player.connected = false;
     } else {
-      this.state.players.delete(client.sessionId);
+      this.state.players.delete(sid);
     }
     console.log(`[leave] ${player.name}`);
   }
@@ -725,6 +794,7 @@ export class GameRoom extends Room<GameRoomState> {
 
     this.state.players.forEach((p: Player) => {
       p.score = 0; p.captures = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
+      p.kickEligible = false; p.voteKickCount = 0;
     });
     this.scoreHistory = new Map();
 
@@ -742,6 +812,19 @@ export class GameRoom extends Room<GameRoomState> {
     this.allOccupied               = false;
     this.lastTurnSlowFraction      = 0.5;
 
+    // Fresh votekick grace timers for all returning players
+    this.kickGraceTimers.forEach(t => clearTimeout(t));
+    this.kickGraceTimers.clear();
+    this.voteKickVotes.clear();
+    this.state.players.forEach((_p: Player, sid: string) => {
+      const timer = setTimeout(() => {
+        const p = this.state.players.get(sid);
+        if (p) p.kickEligible = true;
+        this.kickGraceTimers.delete(sid);
+      }, VOTE_KICK_GRACE_MS);
+      this.kickGraceTimers.set(sid, timer);
+    });
+
     this.unlock();
     console.log("[game]  reset to lobby");
   }
@@ -749,6 +832,8 @@ export class GameRoom extends Room<GameRoomState> {
   private clearTimers() {
     if (this.turnIntervalRef)      { clearInterval(this.turnIntervalRef);      this.turnIntervalRef = null; }
     if (this.countdownIntervalRef) { clearInterval(this.countdownIntervalRef); this.countdownIntervalRef = null; }
+    this.kickGraceTimers.forEach(t => clearTimeout(t));
+    this.kickGraceTimers.clear();
   }
 }
 

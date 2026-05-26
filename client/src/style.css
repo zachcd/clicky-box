@@ -220,6 +220,29 @@ input[type="text"]:focus {
   color: var(--dim);
 }
 
+.kick-btn {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid #3a2a3a;
+  color: var(--dim);
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 99px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.kick-btn:hover {
+  border-color: #c0392b;
+  color: #e74c3c;
+}
+.kick-btn.voted {
+  border-color: #c0392b;
+  color: #e74c3c;
+  background: rgba(231,76,60,0.12);
+}
+
 .pname {
   overflow: hidden;
   text-overflow: ellipsis;
