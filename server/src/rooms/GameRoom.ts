@@ -86,6 +86,7 @@ export class GameRoom extends Room<GameRoomState> {
   private scoreHistory:         Map<string, number[]>                          = new Map();
   private turnIntervalRef:      ReturnType<typeof setInterval> | null           = null;
   private countdownIntervalRef: ReturnType<typeof setInterval> | null           = null;
+  private resetTimerRef:        ReturnType<typeof setTimeout>  | null           = null;
   // Fraction of the last turn's time window used by the slowest active submitter
   // (0 = everyone submitted instantly, 1 = last submission arrived at the very end).
   // Defaults to 0.5 (neutral) so the first turn uses the baseline decay rate.
@@ -205,7 +206,14 @@ export class GameRoom extends Room<GameRoomState> {
     this.onMessage("playAgain", (client: Client) => {
       if (this.state.phase !== "gameover") return;
       const player = this.state.players.get(client.sessionId);
-      if (player) player.ready = true;
+      if (!player) return;
+      player.ready = true;
+      // If all connected players have voted to return, reset immediately
+      const connected = [...this.state.players.values()].filter(p => p.connected);
+      if (connected.length > 0 && connected.every(p => p.ready)) {
+        if (this.resetTimerRef) { clearTimeout(this.resetTimerRef); this.resetTimerRef = null; }
+        this.resetToLobby();
+      }
     });
 
     // Lightweight round-trip probe — client sends { clientTs }, we echo it straight
@@ -782,7 +790,7 @@ export class GameRoom extends Room<GameRoomState> {
       players:    histPlayers,
     });
 
-    setTimeout(() => this.resetToLobby(), 10_000);
+    this.resetTimerRef = setTimeout(() => { this.resetTimerRef = null; this.resetToLobby(); }, 10_000);
   }
 
   private resetToLobby() {
@@ -832,6 +840,7 @@ export class GameRoom extends Room<GameRoomState> {
   private clearTimers() {
     if (this.turnIntervalRef)      { clearInterval(this.turnIntervalRef);      this.turnIntervalRef = null; }
     if (this.countdownIntervalRef) { clearInterval(this.countdownIntervalRef); this.countdownIntervalRef = null; }
+    if (this.resetTimerRef)        { clearTimeout(this.resetTimerRef);         this.resetTimerRef = null; }
     this.kickGraceTimers.forEach(t => clearTimeout(t));
     this.kickGraceTimers.clear();
   }

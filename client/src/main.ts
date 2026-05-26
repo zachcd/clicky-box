@@ -354,6 +354,20 @@ function playerTerritoryCentroid(state: any, sid: string): { x: number; y: numbe
  * Called once per turn boundary (after detectOwnerChanges has filled
  * turnGainedCells, before tracking maps are cleared).
  */
+/**
+ * Map a capture count to a font size scaled relative to the total board size.
+ * Uses a square-root curve on the board-percentage so the same visual weight
+ * applies regardless of map size (small 2-player map vs. large 8-player map).
+ *   ~1 % of board  → ~26 px
+ *   ~5 % of board  → ~31 px
+ *  ~15 % of board  → ~38 px
+ *  ~30 %+ of board → ~56 px (capped)
+ */
+function captureToFontSize(n: number, totalCells: number): number {
+  const pct = totalCells > 0 ? (n / totalCells) * 100 : 0;
+  return Math.round(Math.min(56, 22 + Math.sqrt(pct) * 4.8));
+}
+
 function spawnTurnFloats(state: any) {
   // Skip in real-time mode — turns are too fast for readable text
   if (state.isRealtime || gridParams.W === 0) return;
@@ -387,14 +401,13 @@ function spawnTurnFloats(state: any) {
     const pColor = getPlayerColor(player);
 
     if (isContested) {
-      // Always show race popups — winner gets larger text
+      // Always show race popups — scale with cells actually won
       const text = gainedCount > 0 ? `\u2694 +${gainedCount}` : `\u2694 RACED`;
-      const sz   = gainedCount > 15 ? 26 : gainedCount > 5 ? 22 : 18;
+      const sz   = gainedCount > 0 ? captureToFontSize(gainedCount, totalCells) : 28;
       spawnFloat(text, pos.x, pos.y, pColor, 2600, sz, /*glow*/ true);
     } else if (gainedCount >= gainThreshold) {
-      // Plain big-gain popup
-      const sz = gainedCount > 20 ? 26 : gainedCount > 10 ? 22 : 18;
-      spawnFloat(`+${gainedCount}`, pos.x, pos.y, pColor, 2200, sz, false);
+      // Solo big-gain popup — size proportional to share of board taken
+      spawnFloat(`+${gainedCount}`, pos.x, pos.y, pColor, 2200, captureToFontSize(gainedCount, totalCells), false);
     }
   });
 }

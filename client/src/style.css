@@ -555,6 +555,29 @@ input[type="text"]:focus {
   #score-board {
     display: none;
   }
+
+  /* Bigger timer bar on desktop */
+  #hud {
+    padding: 10px 16px 8px;
+  }
+  #timer-bar-wrap {
+    height: 20px;
+    border-radius: 6px;
+  }
+  #timer-fill {
+    border-radius: 6px;
+  }
+  #timer-bar-outer {
+    margin-bottom: 24px;
+  }
+  #ping-marker {
+    height: 22px;
+    top: -1px;
+  }
+  #ping-label {
+    top: 22px;
+    font-size: 0.65rem;
+  }
 }
 
 .sb-title {
