@@ -4,15 +4,30 @@ import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const INITIAL_TURN_MS         = 20_000;               // starting turn length (slower ramp-up)
-const PHASE1_MIN_MS           = INITIAL_TURN_MS / 2;  // 10 000 ms — 2× speed cap for Phase 1
+const PHASE1_MIN_MS           = 3_000;   // Phase 1 floor — reached in ~14 turns from 20 s
 const PHASE2_SWEET_SPOT_MS    = 2_000;  // decay rate eases below this threshold
-const PHASE2_FAST_FACTOR      = 0.90;   // above sweet spot: −10 %/turn → ~15 turns to 2 s
-const PHASE2_SLOW_FACTOR      = 0.95;   // below sweet spot: −5 %/turn  → ~45 turns to 200 ms
-const REALTIME_MS             = 200;                   // floor — "real-time" threshold
+const REALTIME_MS             = 400;                   // floor — "real-time" threshold
+
+// Player-paced acceleration bounds.
+// The decay factor each turn is interpolated between FAST (all submit instantly)
+// and SLOW (slowest submitter used the full turn) via an outlier-amplifying
+// curve.  Neutral midpoint (slowest fraction ≈ 0.5) reproduces the original
+// fixed rates so ordinary play feels unchanged.
+const PHASE1_FACTOR_FAST      = 0.77;   // Phase 1: everyone submits instantly  (−23 %/turn)
+const PHASE1_FACTOR_SLOW      = 0.97;   // Phase 1: slowest waits till last moment (−3 %/turn)
+// neutral ≈ (0.77+0.97)/2 = 0.87, matching former hard-coded 0.88
+
+const PHASE2_FAST_FACTOR_MIN  = 0.82;   // Phase 2 above sweet-spot: fastest decay (−18 %/turn)
+const PHASE2_FAST_FACTOR_MAX  = 0.97;   // Phase 2 above sweet-spot: slowest decay  (−3 %/turn)
+// neutral ≈ 0.895, matching former PHASE2_FAST_FACTOR = 0.90
+
+const PHASE2_SLOW_FACTOR_MIN  = 0.90;   // Phase 2 below sweet-spot: fastest decay (−10 %/turn)
+const PHASE2_SLOW_FACTOR_MAX  = 0.99;   // Phase 2 below sweet-spot: slowest decay  (−1 %/turn)
+// neutral ≈ 0.945, matching former PHASE2_SLOW_FACTOR = 0.95
 
 const LOBBY_COUNTDOWN_SECONDS = 5;
 
-const EARLY_COMPLETION_TURNS  = 10;  // early end-of-turn allowed only within this many turns
+// Early turn completion is phase-based — see selectColor handler.
 
 const VALID_BORDER_STYLES = ["solid", "double", "rounded"];
 const MIN_PLAYERS             = 2;
@@ -52,6 +67,7 @@ export class GameRoomState extends Schema {
   @type("string")        winnerId:             string            = "";
   @type("uint8")         lobbyCountdown:       number            = 0;
   @type("boolean")       lobbyCountdownActive: boolean           = false;
+  @type("string")        lobbyId:              string            = "global";
 }
 
 // ─── Room ─────────────────────────────────────────────────────────────────────
@@ -67,11 +83,16 @@ export class GameRoom extends Room<GameRoomState> {
   private scoreHistory:         Map<string, number[]>                          = new Map();
   private turnIntervalRef:      ReturnType<typeof setInterval> | null           = null;
   private countdownIntervalRef: ReturnType<typeof setInterval> | null           = null;
+  // Fraction of the last turn's time window used by the slowest active submitter
+  // (0 = everyone submitted instantly, 1 = last submission arrived at the very end).
+  // Defaults to 0.5 (neutral) so the first turn uses the baseline decay rate.
+  private lastTurnSlowFraction: number                                          = 0.5;
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  onCreate(_options: unknown) {
+  onCreate(options: { lobbyId?: string } = {}) {
     this.setState(new GameRoomState());
+    this.state.lobbyId = sanitiseLobbyId(options?.lobbyId);
 
     this.onMessage("setAppearance", (client: Client, data: { color?: string; borderStyle?: string }) => {
       if (this.state.phase !== "lobby") return;
@@ -122,8 +143,9 @@ export class GameRoom extends Room<GameRoomState> {
       player.hasSubmitted   = true;
       player.submittedColor = ci;
 
-      // Allow skipping the remainder of the timer only in the early game.
-      if (this.state.currentTurn < EARLY_COMPLETION_TURNS) {
+      // Allow skipping the timer while the board still has unowned cells (Phase 1).
+      // Once all cells are occupied the full timer runs — every millisecond counts.
+      if (!this.allOccupied) {
         const active = this.activePlayers();
         if (active.length > 0 && active.every(p => p.hasSubmitted)) this.endTurn();
       }
@@ -134,9 +156,16 @@ export class GameRoom extends Room<GameRoomState> {
       const player = this.state.players.get(client.sessionId);
       if (player) player.ready = true;
     });
+
+    // Lightweight round-trip probe — client sends { clientTs }, we echo it straight
+    // back.  The client measures RTT and derives one-way latency for the ping
+    // indicator.  No server state is touched.
+    this.onMessage("ping", (client: Client, data: { clientTs: number }) => {
+      client.send("pong", { clientTs: data.clientTs });
+    });
   }
 
-  onJoin(client: Client, options: { name?: string } = {}) {
+  onJoin(client: Client, options: { name?: string; lobbyId?: string } = {}) {
     if (this.state.phase !== "lobby") {
       throw new Error("Game already in progress — please wait for the next lobby.");
     }
@@ -248,9 +277,10 @@ export class GameRoom extends Room<GameRoomState> {
     this.state.lobbyCountdownActive = false;
     this.state.lobbyCountdown      = 0;
     this.allOccupied               = false;
+    this.lastTurnSlowFraction      = 0.5;
 
     this.lock();
-    console.log(`[game]  started — ${n} players, ${W}×${H} grid (${W * H} cells)`);
+    console.log(`[game]  started — ${n} players, ${W}×${H} grid (${W * H} cells), lobby: ${this.state.lobbyId}`);
     this.beginTurn();
   }
 
@@ -498,6 +528,10 @@ export class GameRoom extends Room<GameRoomState> {
 
     this.state.currentTurn++;
 
+    // Measure how far through the turn the slowest active submitter was.
+    // Used by updateTurnSpeed() to modulate the next turn's decay factor.
+    this.lastTurnSlowFraction = this.computeSlowFraction();
+
     // ── Phase 2 detection ─────────────────────────────────────────────────
     let hasUnowned = false;
     for (let i = 0; i < this.state.cells.length; i++) {
@@ -527,32 +561,73 @@ export class GameRoom extends Room<GameRoomState> {
 
   // ── Speed progression ─────────────────────────────────────────────────────
   //
-  // Phase 1 (unowned cells remain):
-  //   −12 %/turn; floor at PHASE1_MIN_MS (10 000 ms).
-  //   Reaches floor in ~6 turns (was ~13 with the former −5 %/turn).
+  // The timer always accelerates, but HOW FAST depends on when the slowest
+  // active player submitted their move last turn.
   //
-  // Phase 2 (all cells occupied, game not yet over):
-  //   Two-stage decay centred on PHASE2_SWEET_SPOT_MS (2 000 ms):
-  //     • Above 2 s : −10 %/turn (PHASE2_FAST_FACTOR = 0.90)
-  //                   ~15 turns to descend from 10 000 ms → 2 000 ms
-  //     • Below 2 s : −5 %/turn  (PHASE2_SLOW_FACTOR = 0.95)
-  //                   ~45 turns to descend from  2 000 ms → 200 ms
-  //   Total Phase 2 runway: ~60 turns before hitting the 200 ms real-time floor.
-  //   At 200 ms the `isRealtime` flag is set so the client shows the
-  //   blinking timer.
+  // `lastTurnSlowFraction` (0 = submitted instantly, 1 = submitted at the very
+  // last moment) is computed in endTurn() from `submissionOrder`.  Players who
+  // never submitted this turn are excluded from the measurement.
+  //
+  // That fraction is fed through `outlierCurve()` which uses power > 1 on the
+  // deviation from 0.5, so near-median timing barely changes the rate while
+  // true outliers (everyone instantly vs. everyone waiting till the last tick)
+  // produce large swings:
+  //
+  //   Phase 1 (unowned cells remain):
+  //     • Instant submissions  → factor ≈ 0.77  (−23 %/turn, very aggressive)
+  //     • Neutral  (frac ≈ 0.5) → factor ≈ 0.87  (matches former −12 %/turn)
+  //     • Last-moment submit   → factor ≈ 0.97  (−3 %/turn, very gentle)
+  //     • Floor: PHASE1_MIN_MS (3 000 ms)
+  //
+  //   Phase 2 (all cells occupied):
+  //     Two-stage decay centred on PHASE2_SWEET_SPOT_MS (2 000 ms);
+  //     both stages are player-paced.
+  //     • Above 2 s: interpolate PHASE2_FAST_FACTOR_MIN..MAX (0.82..0.97)
+  //     • Below 2 s: interpolate PHASE2_SLOW_FACTOR_MIN..MAX (0.90..0.99)
+  //     • Floor: REALTIME_MS (200 ms) — sets `isRealtime` for client blink
+
+  /** Map slowestFraction (0–1) through a curve that amplifies outliers.
+   *  Large deviations from the neutral midpoint (0.5) are stretched
+   *  disproportionately; small deviations have almost no effect. */
+  private outlierCurve(x: number): number {
+    const d    = x - 0.5;
+    const sign = d >= 0 ? 1 : -1;
+    // power = 1.7: flat near centre, steep at the extremes
+    const curved = sign * Math.pow(Math.abs(d) * 2, 1.7) * 0.5;
+    return Math.max(0, Math.min(1, 0.5 + curved));
+  }
+
+  /** Return the fraction of the turn's allotted time used by the slowest
+   *  active submitter this turn.  Returns 0.5 (neutral) when nobody submitted. */
+  private computeSlowFraction(): number {
+    if (this.submissionOrder.length === 0) return 0.5;
+    let maxFraction = 0;
+    for (const sub of this.submissionOrder) {
+      const frac = Math.min(
+        1,
+        (sub.receivedAt - this.turnStartTime) / this.state.turnDurationMs,
+      );
+      if (frac > maxFraction) maxFraction = frac;
+    }
+    return maxFraction;
+  }
 
   private updateTurnSpeed() {
+    const curved = this.outlierCurve(this.lastTurnSlowFraction);
+
     if (!this.allOccupied) {
-      // Phase 1
+      // Phase 1 — player-paced, floor at PHASE1_MIN_MS
+      const factor = PHASE1_FACTOR_FAST + (PHASE1_FACTOR_SLOW - PHASE1_FACTOR_FAST) * curved;
       this.state.turnDurationMs = Math.max(
         PHASE1_MIN_MS,
-        Math.round(this.state.turnDurationMs * 0.88), // 12 % faster per turn
+        Math.round(this.state.turnDurationMs * factor),
       );
     } else {
-      // Phase 2 — ease the decay rate once turns drop below the sweet spot
-      const factor = this.state.turnDurationMs > PHASE2_SWEET_SPOT_MS
-        ? PHASE2_FAST_FACTOR
-        : PHASE2_SLOW_FACTOR;
+      // Phase 2 — two-stage, both player-paced
+      const [factorMin, factorMax] = this.state.turnDurationMs > PHASE2_SWEET_SPOT_MS
+        ? [PHASE2_FAST_FACTOR_MIN, PHASE2_FAST_FACTOR_MAX]
+        : [PHASE2_SLOW_FACTOR_MIN, PHASE2_SLOW_FACTOR_MAX];
+      const factor = factorMin + (factorMax - factorMin) * curved;
       this.state.turnDurationMs = Math.max(
         REALTIME_MS,
         Math.round(this.state.turnDurationMs * factor),
@@ -563,6 +638,7 @@ export class GameRoom extends Room<GameRoomState> {
     }
     console.log(
       `[turn]  #${this.state.currentTurn}  next: ${this.state.turnDurationMs} ms` +
+      `  (slow-frac: ${this.lastTurnSlowFraction.toFixed(2)} → curved: ${curved.toFixed(2)})` +
       (this.state.isRealtime ? "  [REALTIME]" : ""),
     );
   }
@@ -664,6 +740,7 @@ export class GameRoom extends Room<GameRoomState> {
     this.state.lobbyCountdown      = 0;
     this.state.phase               = "lobby";
     this.allOccupied               = false;
+    this.lastTurnSlowFraction      = 0.5;
 
     this.unlock();
     console.log("[game]  reset to lobby");
@@ -676,6 +753,12 @@ export class GameRoom extends Room<GameRoomState> {
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
+
+function sanitiseLobbyId(raw: string | undefined): string {
+  if (!raw) return "global";
+  const s = raw.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 32);
+  return s || "global";
+}
 
 function sanitiseName(raw: string | undefined, index: number): string {
   return (raw ?? "").trim().slice(0, 20) || `Player ${index + 1}`;

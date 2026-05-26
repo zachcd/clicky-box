@@ -16,7 +16,7 @@ const httpServer = createServer(app);
 const gameServer = new Server({
   transport: new WebSocketTransport({ server: httpServer }),
 });
-gameServer.define("game", GameRoom);
+gameServer.define("game", GameRoom).filterBy(["lobbyId"]);
 
 app.get("/", (_req, res) => {
   res.json({ status: "ok", message: "Clicky Box server running" });
