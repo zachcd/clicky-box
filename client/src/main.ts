@@ -259,12 +259,8 @@ function playGameStart() {
   setTimeout(() => playTone(784, 0.35, "sine", 0.22), 140); // G5
 }
 
-/** Soft click on each new turn.
- *  Silenced once turns become very rapid (below threshold). */
-const NEW_TURN_SOUND_THRESHOLD_MS = 800;
-
-function playNewTurn(turnDurationMs: number, isRealtime: boolean) {
-  if (isRealtime || turnDurationMs < NEW_TURN_SOUND_THRESHOLD_MS) return;
+/** Soft click on each new turn — always played regardless of turn speed. */
+function playNewTurn() {
   playTone(440, 0.08, "sine", 0.10);
 }
 
@@ -1044,7 +1040,7 @@ function updateGame(state: any) {
   if (state.currentTurn !== lastTurnSeen) {
     spawnTurnFloats(state);
     // Play a new-turn sound — silenced automatically once turns become very rapid
-    if (lastTurnSeen !== -1) playNewTurn(state.turnDurationMs as number, !!state.isRealtime);
+    if (lastTurnSeen !== -1) playNewTurn();
     turnGainedCells.clear();
     currentTurnSubmissions.clear();
     state.players.forEach((p: any, sid: string) => { prevTurnScores.set(sid, p.score); });
