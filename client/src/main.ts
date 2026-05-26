@@ -203,6 +203,71 @@ let startAnimState: { startTime: number; cellIdx: number } | null = null;
 const liveScoreHistory = new Map<string, number[]>();
 let liveLastTurn = -1;
 
+// Lobby countdown tracking — one tick sound per decrement
+let prevLobbyCountdown = -1;
+
+// ─── Sound engine ─────────────────────────────────────────────────────────────
+//
+// All audio is synthesised via the Web Audio API — no external files required.
+// The AudioContext is created lazily so it always follows a user gesture.
+
+let audioCtx: AudioContext | null = null;
+
+function getAudioCtx(): AudioContext | null {
+  try {
+    if (!audioCtx)
+      audioCtx = new (window.AudioContext ||
+        (window as any).webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  } catch {
+    return null;
+  }
+}
+
+function playTone(
+  freq: number,
+  durationSec: number,
+  type: OscillatorType = "sine",
+  gainPeak = 0.18,
+) {
+  const ac = getAudioCtx();
+  if (!ac) return;
+  const osc  = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.connect(gain);
+  gain.connect(ac.destination);
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, ac.currentTime);
+  gain.gain.setValueAtTime(gainPeak, ac.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + durationSec);
+  osc.start(ac.currentTime);
+  osc.stop(ac.currentTime + durationSec);
+}
+
+/** Short tick for each lobby countdown beat.
+ *  Pitches up on the final second to build urgency. */
+function playCountdownTick(n: number) {
+  const freq = n <= 1 ? 880 : 660;
+  playTone(freq, 0.15, "sine", 0.22);
+}
+
+/** Ascending C5-E5-G5 triad burst played when the game begins. */
+function playGameStart() {
+  playTone(523, 0.20, "sine", 0.22);                       // C5
+  setTimeout(() => playTone(659, 0.20, "sine", 0.22), 70);  // E5
+  setTimeout(() => playTone(784, 0.35, "sine", 0.22), 140); // G5
+}
+
+/** Soft click on each new turn.
+ *  Silenced once turns become very rapid (below threshold). */
+const NEW_TURN_SOUND_THRESHOLD_MS = 800;
+
+function playNewTurn(turnDurationMs: number, isRealtime: boolean) {
+  if (isRealtime || turnDurationMs < NEW_TURN_SOUND_THRESHOLD_MS) return;
+  playTone(440, 0.08, "sine", 0.10);
+}
+
 // ─── Ping probe ───────────────────────────────────────────────────────────────
 // We send a timestamped message; the server echoes clientTs straight back.
 // RTT = Date.now() - clientTs.  One-way latency ≈ RTT / 2.
@@ -819,8 +884,11 @@ function updateUI(state: any) {
 
   if (phase !== prevPhase) {
     prevPhase = phase;
-    if (phase === "lobby") showScreen("lobby");
-    else if (phase === "playing") {
+    if (phase === "lobby") {
+      showScreen("lobby");
+      prevLobbyCountdown = -1; // reset so ticks fire fresh on the next countdown
+    } else if (phase === "playing") {
+      playGameStart();
       showScreen("game");
       localHasSubmitted = false; // fresh game — clear any leftover lock
       lastTurnSeen = -1;
@@ -905,7 +973,13 @@ function updateLobby(state: any) {
   if (state.lobbyCountdownActive) {
     statusEl.textContent = `Starting in ${state.lobbyCountdown}…`;
     statusEl.className = "lobby-status countdown";
+    // Fire one tick sound per decrement (skip the 0 — game-start sound covers that)
+    if (state.lobbyCountdown !== prevLobbyCountdown && state.lobbyCountdown > 0) {
+      playCountdownTick(state.lobbyCountdown as number);
+    }
+    prevLobbyCountdown = state.lobbyCountdown as number;
   } else {
+    prevLobbyCountdown = -1;
     const nReady = [...state.players.values()].filter(
       (p: any) => p.ready,
     ).length;
@@ -969,6 +1043,8 @@ function updateGame(state: any) {
   // At each turn boundary: spawn popups, then reset per-turn tracking
   if (state.currentTurn !== lastTurnSeen) {
     spawnTurnFloats(state);
+    // Play a new-turn sound — silenced automatically once turns become very rapid
+    if (lastTurnSeen !== -1) playNewTurn(state.turnDurationMs as number, !!state.isRealtime);
     turnGainedCells.clear();
     currentTurnSubmissions.clear();
     state.players.forEach((p: any, sid: string) => { prevTurnScores.set(sid, p.score); });
