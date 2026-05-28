@@ -622,12 +622,23 @@ export class GameRoom extends Room<GameRoomState> {
     // Update turn duration for next turn
     this.updateTurnSpeed();
 
-    // ── Win condition: one player owns every single cell ──────────────────
+    // ── Win conditions ─────────────────────────────────────────────────────
     const total = this.state.cells.length;
     let winnerId = "";
+
+    // Classic: one player owns every single cell
     this.state.players.forEach((p: Player, id: string) => {
       if (p.score === total) winnerId = id;
     });
+
+    // Elimination: all but one player has been reduced to 0 cells
+    if (!winnerId) {
+      const withCells = [...this.state.players.values()].filter(p => p.score > 0);
+      if (withCells.length === 1) {
+        winnerId = withCells[0].sessionId;
+        console.log(`[game]  elimination — ${withCells[0].name} is last player standing`);
+      }
+    }
 
     if (winnerId) {
       this.endGame(winnerId);
