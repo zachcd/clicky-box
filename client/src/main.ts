@@ -375,6 +375,7 @@ const floatingTexts: FloatingText[] = [];
 const currentTurnSubmissions = new Map<string, number>(); // sid → colorIndex submitted this turn
 const prevTurnScores         = new Map<string, number>(); // sid → score at start of this turn
 const turnGainedCells        = new Map<string, number[]>(); // sid → cell indices gained this turn
+const recordedSubmissions    = new Set<string>();           // sid → submission already logged in history
 
 function spawnFloat(
   text: string, x: number, y: number, color: string,
@@ -535,6 +536,11 @@ function detectOwnerChanges(state: any) {
       // Record which cells each player gained this turn
       if (!turnGainedCells.has(curr)) turnGainedCells.set(curr, []);
       turnGainedCells.get(curr)!.push(i);
+      recordMatchEvent("cell-capture", state, `Cell ${i + 1} captured by ${owner?.name ?? curr}`, {
+        cellIdx: i,
+        ownerId: curr,
+        colorIndex: state.cells[i].colorIndex,
+      });
     }
     prevOwners.set(i, curr);
   }
@@ -565,7 +571,95 @@ const myVoteKicks = new Set<string>(); // session IDs this client has voted to k
 let scoreHistoryData: {
   totalCells: number;
   players: Array<{ name: string; color: string; scores: number[] }>;
+  eliminationOrder?: string[];
+  accolades?: {
+    survivor: { playerId: string; turnsCount: number; threshold: number } | null;
+    colorFan: { playerId: string; topColor: number; topCount: number; secondCount: number } | null;
+    racer:    { playerId: string; wins: number } | null;
+    holder:   { playerId: string; streak: number } | null;
+  };
 } | null = null;
+
+// ─── Local match history / replay ─────────────────────────────────────────────
+
+const MATCH_HISTORY_STORAGE_KEY = "clicky-box.match-history.v1";
+const MATCH_HISTORY_LIMIT = 20;
+
+interface MatchReplayPlayer {
+  sessionId: string;
+  name: string;
+  color: string;
+  borderStyle: string;
+  playerIndex: number;
+  score: number;
+  captures: number;
+}
+
+interface MatchReplayCell {
+  colorIndex: number;
+  ownerId: string;
+}
+
+interface MatchReplaySnapshot {
+  gridWidth: number;
+  gridHeight: number;
+  currentTurn: number;
+  phase: string;
+  winnerId: string;
+  turnDurationMs: number;
+  isRealtime: boolean;
+  cells: MatchReplayCell[];
+  players: MatchReplayPlayer[];
+}
+
+interface MatchReplayEvent {
+  id: string;
+  type: "match-start" | "turn-start" | "player-submit" | "cell-capture" | "match-end";
+  at: number;
+  turn: number;
+  label: string;
+  data?: Record<string, unknown>;
+  snapshot?: MatchReplaySnapshot;
+}
+
+interface MatchPlacement {
+  sessionId: string;
+  name: string;
+  rank: number;
+  totalPlayers: number;
+}
+
+interface MatchHistoryRecord {
+  schemaVersion: 1;
+  matchId: string;
+  lobbyId: string;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+  turnCount: number;
+  winnerId: string;
+  winnerName: string;
+  viewerSessionId: string;
+  viewerPlacement: MatchPlacement | null;
+  players: MatchReplayPlayer[];
+  events: MatchReplayEvent[];
+}
+
+interface MatchHistoryDraft {
+  record: MatchHistoryRecord;
+  loggedSubmissionsThisTurn: Set<string>;
+  lastObservedTurn: number;
+}
+
+let matchHistory: MatchHistoryRecord[] = loadMatchHistory();
+let selectedReplayId: string | null = matchHistory[0]?.matchId ?? null;
+let replayState: {
+  playing: boolean;
+  eventIndex: number;
+  timer: number | null;
+  speed: number;
+} = { playing: false, eventIndex: 0, timer: null, speed: 6 };
+let activeMatchDraft: MatchHistoryDraft | null = null;
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
@@ -582,6 +676,17 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("ready-btn").addEventListener("click", () => room?.send("ready"));
   $("play-again-btn").addEventListener("click", () => room?.send("playAgain"));
+  $("replay-play-btn")?.addEventListener("click", toggleReplayPlayback);
+  $("replay-prev-btn")?.addEventListener("click", () => stepReplay(-1));
+  $("replay-next-btn")?.addEventListener("click", () => stepReplay(1));
+  $("replay-seek")?.addEventListener("input", (e) => {
+    pauseReplayPlayback();
+    setReplayEventIndex(Number((e.target as HTMLInputElement).value));
+  });
+  $("replay-speed")?.addEventListener("change", (e) => {
+    replayState.speed = Number((e.target as HTMLSelectElement).value) || 6;
+    if (replayState.playing) scheduleReplayAdvance();
+  });
 
   $("new-lobby-btn").addEventListener("click", () =>
     navigateToSlug(randomLobbySlug()),
@@ -625,6 +730,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   resizeCanvas();
   showScreen("connect");
+  renderHistorySidebar();
   requestAnimationFrame(renderLoop);
 });
 
@@ -723,6 +829,7 @@ function applyCbToggle() {
 function showScreen(name: keyof typeof screens) {
   for (const [k, el] of Object.entries(screens))
     el.classList.toggle("hidden", k !== name);
+  renderHistorySidebar();
   if (name === "game") resizeCanvas();
 }
 
@@ -730,6 +837,13 @@ function resizeCanvas() {
   const wrap = $("canvas-wrap");
   canvas.width = wrap.clientWidth;
   canvas.height = wrap.clientHeight;
+  // Re-scale the sidebar player list to match the new viewport dimensions
+  const sidebar = $("sidebar");
+  const scoresEl = $("sidebar-scores");
+  if (sidebar && scoresEl) {
+    const count = scoresEl.childElementCount;
+    if (count > 0) scaleSidebarEntries(sidebar, count);
+  }
 }
 
 // ─── Join ─────────────────────────────────────────────────────────────────────
@@ -765,6 +879,8 @@ async function joinGame() {
       room = null;
       myVoteKicks.clear();
       stopPingProbe();
+      activeMatchDraft = null;
+      pauseReplayPlayback();
       showScreen("connect");
     });
 
@@ -772,6 +888,8 @@ async function joinGame() {
       room = null;
       myVoteKicks.clear();
       stopPingProbe();
+      activeMatchDraft = null;
+      pauseReplayPlayback();
       showScreen("connect");
       $("connect-error").textContent = "You were removed from the lobby by a vote kick.";
     });
@@ -789,7 +907,12 @@ async function joinGame() {
     });
     room.onMessage("scoreHistory", (data: typeof scoreHistoryData) => {
       scoreHistoryData = data;
-      renderScoreChart();
+      // The state-patch for phase=gameover arrives before this message, so
+      // updateGameover was already called once (without elimination order / accolades).
+      // Re-render now that we have the full dataset.
+      const s = room?.state as any;
+      if (s?.phase === "gameover") updateGameover(s);
+      else { renderScoreChart(); }
     });
 
     // Echo-based RTT measurement — server bounces clientTs straight back
@@ -895,7 +1018,9 @@ function updateUI(state: any) {
       floatingTexts.length = 0;
       currentTurnSubmissions.clear();
       turnGainedCells.clear();
+      recordedSubmissions.clear();
       prevTurnScores.clear();
+      beginMatchHistory(state);
       // Seed prevTurnScores so the first turn's gains are measured from game-start scores
       state.players?.forEach((p: any, sid: string) => { prevTurnScores.set(sid, p.score ?? 0); });
       // Find this player's starting cell and trigger the zoom-out animation
@@ -908,7 +1033,12 @@ function updateUI(state: any) {
         }
       }
       setColorBtnsEnabled(true);
-    } else if (phase === "gameover") showScreen("gameover");
+    } else if (phase === "gameover") {
+      finalizeMatchHistory(state);
+      showScreen("gameover");
+      renderMatchHistoryPanel();
+      renderHistorySidebar();
+    }
   }
 
   if (phase === "lobby") updateLobby(state);
@@ -1033,6 +1163,14 @@ function updateGame(state: any) {
   state.players.forEach((p: any, sid: string) => {
     if (p.hasSubmitted && p.submittedColor >= 0) {
       currentTurnSubmissions.set(sid, p.submittedColor);
+      if (!recordedSubmissions.has(sid)) {
+        recordedSubmissions.add(sid);
+        recordMatchEvent("player-submit", state, `${p.name} picked ${GRID_NAMES[p.submittedColor] ?? p.submittedColor}`, {
+          playerId: sid,
+          playerName: p.name,
+          colorIndex: p.submittedColor,
+        });
+      }
     }
   });
 
@@ -1041,8 +1179,14 @@ function updateGame(state: any) {
     spawnTurnFloats(state);
     // Play a new-turn sound — silenced automatically once turns become very rapid
     if (lastTurnSeen !== -1) playNewTurn();
+    recordMatchEvent("turn-start", state, `Turn ${state.currentTurn + 1} starts`, {
+      turn: state.currentTurn,
+      turnDurationMs: state.turnDurationMs,
+      turnTimeLeft: state.turnTimeLeft,
+    }, true);
     turnGainedCells.clear();
     currentTurnSubmissions.clear();
+    recordedSubmissions.clear();
     state.players.forEach((p: any, sid: string) => { prevTurnScores.set(sid, p.score); });
     lastTurnSeen      = state.currentTurn;
     localHasSubmitted = false;
@@ -1096,7 +1240,54 @@ function updateSidebar(state: any) {
       `<span class="sb-score">${p.score}</span>`;
     scoresEl.appendChild(div);
   }
+
+  // ── Dynamic scaling: font / dot / spacing grow with available space per entry ──
+  //
+  // The sidebar height minus the chart section and title overhead is divided
+  // equally among all players. A taller per-entry budget → larger text and dots,
+  // making the list far more readable at low player counts while staying compact
+  // when the lobby is full.
+  scaleSidebarEntries(sidebar, arr.length);
+
   renderLiveChart(state);
+}
+
+function scaleSidebarEntries(sidebar: HTMLElement, playerCount: number) {
+  const n = Math.max(1, playerCount);
+
+  // Use the sidebar's actual rendered height; fall back to a viewport estimate
+  // (HUD ≈ 78 px + colour bar ≈ 74 px → ~152 px combined overhead)
+  const sidebarH = sidebar.clientHeight || Math.max(200, window.innerHeight - 152);
+
+  // Chart height mirrors the CSS clamp(70px, 15vh, 160px)
+  const chartH = Math.min(160, Math.max(70, window.innerHeight * 0.15));
+
+  // Overhead inside the sidebar:
+  //   top+bottom padding (20) + "Players" title (12 + 6 gap) +
+  //   "Territory" title (12 + 6 gap) + chart + 2 extra flex gaps (6 × 2)
+  const overhead = 20 + 18 + 18 + chartH + 12;
+
+  // Available vertical pixels shared across all player rows
+  const entriesH = Math.max(n * 20, sidebarH - overhead);
+  const perH = entriesH / n;
+
+  // Font: 14% of per-entry height, clamped between 11 px and 22 px
+  const fontPx = Math.max(11, Math.min(22, perH * 0.14));
+  const fontRem = +(fontPx / 16).toFixed(2);
+
+  // Score label is slightly smaller than the name
+  const scoreRem = +((fontPx * 0.85) / 16).toFixed(2);
+
+  // Dot size proportional to font; floor/ceiling in px
+  const dotPx = Math.round(Math.max(10, Math.min(20, fontPx * 0.78)));
+
+  // Gap between dot and name text
+  const gapPx = Math.round(Math.max(4, Math.min(10, fontPx * 0.5)));
+
+  sidebar.style.setProperty("--sb-font-size",  `${fontRem}rem`);
+  sidebar.style.setProperty("--sb-score-size", `${scoreRem}rem`);
+  sidebar.style.setProperty("--sb-dot-size",   `${dotPx}px`);
+  sidebar.style.setProperty("--sb-gap",        `${gapPx}px`);
 }
 
 function renderLiveChart(state: any) {
@@ -1155,7 +1346,20 @@ function updateGameover(state: any) {
   scoresEl.innerHTML = "";
   const arr: any[] = [];
   state.players.forEach((p: any) => arr.push(p));
-  arr.sort((a: any, b: any) => b.captures - a.captures);
+
+  // Sort by elimination order when available (last eliminated = winner = rank #1).
+  // Falls back to captures on the first render before scoreHistory arrives.
+  const elimOrder = scoreHistoryData?.eliminationOrder;
+  if (elimOrder && elimOrder.length > 0) {
+    const rankMap = new Map(elimOrder.map((sid, i) => [sid, i]));
+    arr.sort((a, b) => {
+      const ra = rankMap.get(a.sessionId) ?? -1;
+      const rb = rankMap.get(b.sessionId) ?? -1;
+      return rb - ra; // higher index = survived longer = better rank
+    });
+  } else {
+    arr.sort((a: any, b: any) => b.captures - a.captures);
+  }
 
   const medals = ["🥇", "🥈", "🥉"];
   arr.forEach((p, i) => {
@@ -1170,6 +1374,83 @@ function updateGameover(state: any) {
   });
   $("gameover-note").textContent = "Lobby resets automatically in 10 s";
   renderScoreChart();
+  renderAccolades(state);
+  renderMatchHistoryPanel();
+}
+
+// ── Accolades ───────────────────────────────────────────────────────────────────────────────
+
+function renderAccolades(state: any) {
+  const el = $("accolades");
+  if (!el) return;
+
+  const ac = scoreHistoryData?.accolades;
+  if (!ac) { el.innerHTML = ""; return; }
+
+  // Helper: coloured player name span, looked up from live state
+  const playerTag = (sid: string): string => {
+    const p = state.players.get(sid);
+    if (!p) return `<span class="accolade-player">?</span>`;
+    return `<span class="accolade-player" style="color:${getPlayerColor(p)}">${esc(p.name)}</span>`;
+  };
+
+  const COLOR_NAMES = ["Red", "Blue", "Green", "Orange"];
+  const rows: string[] = [];
+
+  if (ac.survivor) {
+    const { playerId, turnsCount, threshold } = ac.survivor;
+    rows.push(
+      `<div class="accolade-entry">` +
+      `<span class="accolade-icon">🌱</span>` +
+      `<span class="accolade-label">Survivor</span>` +
+      playerTag(playerId) +
+      `<span class="accolade-stat">${turnsCount} turns under ${threshold} cells</span>` +
+      `</div>`,
+    );
+  }
+
+  if (ac.colorFan) {
+    const { playerId, topColor, topCount, secondCount } = ac.colorFan;
+    const topName = COLOR_NAMES[topColor] ?? "?";
+    const secondText = secondCount > 0 ? ` (2nd: ×${secondCount})` : "";
+    rows.push(
+      `<div class="accolade-entry">` +
+      `<span class="accolade-icon">🎨</span>` +
+      `<span class="accolade-label">Color Fan</span>` +
+      playerTag(playerId) +
+      `<span class="accolade-stat">${topName} ×${topCount}${secondText}</span>` +
+      `</div>`,
+    );
+  }
+
+  if (ac.racer) {
+    const { playerId, wins } = ac.racer;
+    rows.push(
+      `<div class="accolade-entry">` +
+      `<span class="accolade-icon">⚔️</span>` +
+      `<span class="accolade-label">Racer</span>` +
+      playerTag(playerId) +
+      `<span class="accolade-stat">${wins} race win${wins !== 1 ? "s" : ""}</span>` +
+      `</div>`,
+    );
+  }
+
+  if (ac.holder) {
+    const { playerId, streak } = ac.holder;
+    rows.push(
+      `<div class="accolade-entry">` +
+      `<span class="accolade-icon">🏰</span>` +
+      `<span class="accolade-label">Holder</span>` +
+      playerTag(playerId) +
+      `<span class="accolade-stat">${streak}-turn hold</span>` +
+      `</div>`,
+    );
+  }
+
+  if (rows.length === 0) { el.innerHTML = ""; return; }
+
+  el.innerHTML =
+    `<p class="chart-title accolades-title">Accolades</p>` + rows.join("");
 }
 
 // ─── Canvas render loop ───────────────────────────────────────────────────────
@@ -1246,6 +1527,7 @@ function renderLoop() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     canvas.style.cursor = "default";
   }
+  if (!screens.gameover.classList.contains("hidden")) renderReplayViewer();
   requestAnimationFrame(renderLoop);
 }
 
@@ -1614,4 +1896,581 @@ function markTakenSwatches(state: any) {
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ─── Local match history / replay helpers ────────────────────────────────────
+
+function makeMatchId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `m-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function loadMatchHistory(): MatchHistoryRecord[] {
+  try {
+    const raw = localStorage.getItem(MATCH_HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is MatchHistoryRecord => !!item && typeof item === "object" && (item as any).schemaVersion === 1)
+      .map((item: any) => ({
+        ...item,
+        turnCount: item.turnCount ?? 0,
+        viewerSessionId: item.viewerSessionId ?? "",
+        viewerPlacement: item.viewerPlacement ?? null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function saveMatchHistory(history: MatchHistoryRecord[]) {
+  try {
+    localStorage.setItem(MATCH_HISTORY_STORAGE_KEY, JSON.stringify(history.slice(0, MATCH_HISTORY_LIMIT)));
+  } catch {
+    // Ignore storage quota / privacy errors.
+  }
+}
+
+function cloneSnapshot(state: any): MatchReplaySnapshot {
+  return {
+    gridWidth: state.gridWidth ?? 0,
+    gridHeight: state.gridHeight ?? 0,
+    currentTurn: state.currentTurn ?? 0,
+    phase: state.phase ?? "",
+    winnerId: state.winnerId ?? "",
+    turnDurationMs: state.turnDurationMs ?? 0,
+    isRealtime: !!state.isRealtime,
+    cells: (state.cells ?? []).map((cell: any) => ({
+      colorIndex: cell.colorIndex ?? 0,
+      ownerId: cell.ownerId ?? "",
+    })),
+    players: [...(state.players?.values?.() ?? [])].map((p: any) => ({
+      sessionId: p.sessionId ?? "",
+      name: p.name ?? "",
+      color: getPlayerColor(p),
+      borderStyle: p.borderStyle ?? "solid",
+      playerIndex: p.playerIndex ?? 0,
+      score: p.score ?? 0,
+      captures: p.captures ?? 0,
+    })),
+  };
+}
+
+function beginMatchHistory(state: any) {
+  activeMatchDraft = {
+    record: {
+      schemaVersion: 1,
+      matchId: makeMatchId(),
+      lobbyId: state.lobbyId ?? getLobbySlug(),
+      startedAt: Date.now(),
+      endedAt: 0,
+      durationMs: 0,
+      turnCount: 0,
+      winnerId: "",
+      winnerName: "",
+      viewerSessionId: mySessionId,
+      viewerPlacement: null,
+      players: [...(state.players?.values?.() ?? [])].map((p: any) => ({
+        sessionId: p.sessionId ?? "",
+        name: p.name ?? "",
+        color: getPlayerColor(p),
+        borderStyle: p.borderStyle ?? "solid",
+        playerIndex: p.playerIndex ?? 0,
+        score: p.score ?? 0,
+        captures: p.captures ?? 0,
+      })),
+      events: [],
+    },
+    loggedSubmissionsThisTurn: new Set<string>(),
+    lastObservedTurn: -1,
+  };
+  recordMatchEvent("match-start", state, `Match begins in ${state.lobbyId ?? getLobbySlug()}`, {
+    lobbyId: state.lobbyId ?? getLobbySlug(),
+    gridWidth: state.gridWidth ?? 0,
+    gridHeight: state.gridHeight ?? 0,
+    turnDurationMs: state.turnDurationMs ?? 0,
+    isRealtime: !!state.isRealtime,
+  }, true);
+}
+
+function recordMatchEvent(
+  type: MatchReplayEvent["type"],
+  state: any,
+  label: string,
+  data: Record<string, unknown> = {},
+  includeSnapshot = false,
+) {
+  if (!activeMatchDraft) return;
+  const at = Date.now();
+  const turn = state?.currentTurn ?? activeMatchDraft.lastObservedTurn ?? 0;
+  const event: MatchReplayEvent = {
+    id: `${activeMatchDraft.record.matchId}-${activeMatchDraft.record.events.length}`,
+    type,
+    at,
+    turn,
+    label,
+    data: Object.keys(data).length ? data : undefined,
+    snapshot: includeSnapshot ? cloneSnapshot(state) : undefined,
+  };
+  activeMatchDraft.record.events.push(event);
+  activeMatchDraft.lastObservedTurn = turn;
+}
+
+function finalizeMatchHistory(state: any) {
+  if (!activeMatchDraft) return;
+  const record = activeMatchDraft.record;
+  record.endedAt = Date.now();
+  record.durationMs = Math.max(0, record.endedAt - record.startedAt);
+  record.turnCount = Math.max(record.turnCount, state?.currentTurn ?? 0);
+  const winner = state?.players?.get?.(state.winnerId);
+  record.winnerId = state?.winnerId ?? "";
+  record.winnerName = winner?.name ?? "";
+
+  record.players = [...(state.players?.values?.() ?? [])].map((p: any) => ({
+    sessionId: p.sessionId ?? "",
+    name: p.name ?? "",
+    color: getPlayerColor(p),
+    borderStyle: p.borderStyle ?? "solid",
+    playerIndex: p.playerIndex ?? 0,
+    score: p.score ?? 0,
+    captures: p.captures ?? 0,
+  }));
+  record.viewerPlacement = computeViewerPlacement(record);
+  record.events.push({
+    id: `${record.matchId}-${record.events.length}`,
+    type: "match-end",
+    at: record.endedAt,
+    turn: state?.currentTurn ?? activeMatchDraft.lastObservedTurn ?? 0,
+    label: winner ? `${winner.name} wins the match` : "Match ends",
+    data: { winnerId: record.winnerId },
+    snapshot: cloneSnapshot(state),
+  });
+
+  const next = [record, ...matchHistory.filter((m) => m.matchId !== record.matchId)].slice(0, MATCH_HISTORY_LIMIT);
+  matchHistory = next;
+  selectedReplayId = record.matchId;
+  saveMatchHistory(matchHistory);
+  activeMatchDraft = null;
+  replayState.playing = false;
+  if (replayState.timer !== null) {
+    clearTimeout(replayState.timer);
+    replayState.timer = null;
+  }
+  replayState.eventIndex = 0;
+}
+
+function getSelectedMatchRecord(): MatchHistoryRecord | null {
+  if (!matchHistory.length) return null;
+  if (selectedReplayId) {
+    const found = matchHistory.find((m) => m.matchId === selectedReplayId);
+    if (found) return found;
+  }
+  selectedReplayId = matchHistory[0].matchId;
+  return matchHistory[0];
+}
+
+function getSnapshotAt(record: MatchHistoryRecord, eventIndex: number): MatchReplaySnapshot | null {
+  for (let i = Math.min(eventIndex, record.events.length - 1); i >= 0; i--) {
+    const snap = record.events[i]?.snapshot;
+    if (snap) return snap;
+  }
+  return record.events.find((e) => e.snapshot)?.snapshot ?? null;
+}
+
+function formatHistoryTime(ms: number): string {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  const mm = Math.floor(sec / 60);
+  const ss = sec % 60;
+  return `${mm}:${String(ss).padStart(2, "0")}`;
+}
+
+function formatHistoryStamp(ms: number): string {
+  try {
+    return new Date(ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  } catch {
+    return String(ms);
+  }
+}
+
+function formatOrdinal(n: number): string {
+  const s = n % 100;
+  if (s >= 11 && s <= 13) return `${n}th`;
+  switch (n % 10) {
+    case 1: return `${n}st`;
+    case 2: return `${n}nd`;
+    case 3: return `${n}rd`;
+    default: return `${n}th`;
+  }
+}
+
+function computeViewerPlacement(record: MatchHistoryRecord): MatchPlacement | null {
+  const self = record.viewerSessionId;
+  const ranked = [...record.players].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.captures !== a.captures) return b.captures - a.captures;
+    return a.name.localeCompare(b.name);
+  });
+  const selfIdx = ranked.findIndex((p) => p.sessionId === self);
+  if (selfIdx === -1) return record.viewerPlacement ?? null;
+  const selfPlayer = ranked[selfIdx];
+  return {
+    sessionId: selfPlayer.sessionId,
+    name: selfPlayer.name,
+    rank: selfIdx + 1,
+    totalPlayers: ranked.length,
+  };
+}
+
+function getMatchSummary(record: MatchHistoryRecord): string {
+  const placement = record.viewerPlacement ?? computeViewerPlacement(record);
+  const placementText = placement ? `${formatOrdinal(placement.rank)} / ${placement.totalPlayers}` : "—";
+  const turns = Math.max(0, record.turnCount ?? 0);
+  const turnsText = `${turns} turn${turns === 1 ? "" : "s"}`;
+  const winnerText = record.winnerName || "Unknown winner";
+  const playerCount = `${record.players.length} player${record.players.length === 1 ? "" : "s"}`;
+  return `${placementText} · ${playerCount} · ${turnsText} · ${winnerText}`;
+}
+
+function setReplayEventIndex(index: number) {
+  const record = getSelectedMatchRecord();
+  if (!record) return;
+  replayState.eventIndex = Math.max(0, Math.min(index, Math.max(0, record.events.length - 1)));
+  refreshReplayUI();
+  renderMatchHistoryPanel(false);
+}
+
+function stepReplay(delta: number) {
+  setReplayEventIndex(replayState.eventIndex + delta);
+}
+
+function pauseReplayPlayback() {
+  replayState.playing = false;
+  if (replayState.timer !== null) {
+    clearTimeout(replayState.timer);
+    replayState.timer = null;
+  }
+  refreshReplayUI();
+}
+
+function scheduleReplayAdvance() {
+  if (!replayState.playing) return;
+  const record = getSelectedMatchRecord();
+  if (!record || record.events.length <= 1) {
+    pauseReplayPlayback();
+    return;
+  }
+  const nextIndex = Math.min(replayState.eventIndex + 1, record.events.length - 1);
+  if (nextIndex === replayState.eventIndex) {
+    pauseReplayPlayback();
+    return;
+  }
+  const curr = record.events[replayState.eventIndex];
+  const next = record.events[nextIndex];
+  const delta = Math.max(120, Math.min(1500, ((next.at - curr.at) || 250) / replayState.speed));
+  if (replayState.timer !== null) clearTimeout(replayState.timer);
+  replayState.timer = window.setTimeout(() => {
+    replayState.timer = null;
+    setReplayEventIndex(nextIndex);
+    if (replayState.eventIndex < record.events.length - 1) scheduleReplayAdvance();
+    else pauseReplayPlayback();
+  }, delta);
+  refreshReplayUI();
+}
+
+function toggleReplayPlayback() {
+  const record = getSelectedMatchRecord();
+  if (!record || record.events.length <= 1) return;
+  if (replayState.playing) {
+    pauseReplayPlayback();
+    return;
+  }
+  if (replayState.eventIndex >= record.events.length - 1) replayState.eventIndex = 0;
+  replayState.playing = true;
+  refreshReplayUI();
+  scheduleReplayAdvance();
+}
+
+function refreshReplayUI() {
+  const record = getSelectedMatchRecord();
+  const playBtn = $("replay-play-btn") as HTMLButtonElement | null;
+  const seek = $("replay-seek") as HTMLInputElement | null;
+  const info = $("replay-info") as HTMLElement | null;
+  const title = $("replay-title") as HTMLElement | null;
+  const speedSel = $("replay-speed") as HTMLSelectElement | null;
+  const timeline = $("replay-timeline") as HTMLElement | null;
+  if (!playBtn || !seek || !info || !title || !speedSel || !timeline) return;
+
+  if (!record) {
+    playBtn.disabled = true;
+    seek.disabled = true;
+    title.textContent = "No saved matches yet";
+    info.textContent = "Play a match to build local history.";
+    timeline.innerHTML = "";
+    return;
+  }
+
+  playBtn.disabled = record.events.length <= 1;
+  seek.disabled = record.events.length <= 1;
+  playBtn.textContent = replayState.playing ? "Pause" : "Play";
+  title.textContent = `${record.lobbyId} · ${record.winnerName || "Replay"}`;
+  seek.max = String(Math.max(0, record.events.length - 1));
+  seek.value = String(Math.min(replayState.eventIndex, Math.max(0, record.events.length - 1)));
+  speedSel.value = String(replayState.speed);
+  const event = record.events[Math.min(replayState.eventIndex, record.events.length - 1)];
+  if (event) {
+    info.textContent = `${event.label} · ${formatHistoryTime(event.at - record.startedAt)} · ${event.type}`;
+  }
+
+  timeline.innerHTML = "";
+  record.events.forEach((ev, i) => {
+    const btn = document.createElement("button");
+    btn.className = `timeline-chip${i === replayState.eventIndex ? " active" : ""}`;
+    btn.title = ev.label;
+    btn.textContent = `${formatHistoryTime(ev.at - record.startedAt)} ${ev.type}`;
+    btn.addEventListener("click", () => {
+      pauseReplayPlayback();
+      setReplayEventIndex(i);
+    });
+    timeline.appendChild(btn);
+  });
+}
+
+function renderMatchHistoryPanel(renderTimeline = true) {
+  const list = $("match-history-list") as HTMLElement | null;
+  if (!list) return;
+
+  const record = getSelectedMatchRecord();
+  if (!matchHistory.length) {
+    list.innerHTML = `<p class="history-empty">No saved matches yet.</p>`;
+    refreshReplayUI();
+    renderHistorySidebar();
+    return;
+  }
+
+  list.innerHTML = "";
+  matchHistory.forEach((match) => {
+    const btn = document.createElement("button");
+    btn.className = `history-item${match.matchId === selectedReplayId ? " active" : ""}`;
+    const winner = match.winnerName || "Unknown";
+    const top = [...match.players].sort((a, b) => b.score - a.score).slice(0, 3);
+    btn.innerHTML = `
+      <span class="history-item-title">${esc(match.lobbyId)}</span>
+      <span class="history-item-meta">${formatHistoryStamp(match.startedAt)} · ${esc(winner)} · ${getMatchSummary(match)}</span>
+      <span class="history-item-sub">${top.map((p) => esc(p.name)).join(" · ")}</span>
+    `;
+    btn.addEventListener("click", () => {
+      selectedReplayId = match.matchId;
+      replayState.playing = false;
+      if (replayState.timer !== null) {
+        clearTimeout(replayState.timer);
+        replayState.timer = null;
+      }
+      replayState.eventIndex = 0;
+      renderMatchHistoryPanel();
+      renderHistorySidebar();
+    });
+    list.appendChild(btn);
+  });
+
+  if (renderTimeline) refreshReplayUI();
+  if (record) renderReplayViewer();
+  renderHistorySidebar();
+}
+
+function renderHistorySidebar() {
+  const sidebar = $("history-sidebar") as HTMLElement | null;
+  const list = $("history-sidebar-list") as HTMLElement | null;
+  const details = $("history-sidebar-details") as HTMLElement | null;
+  if (!sidebar || !list || !details) return;
+
+  const record = getSelectedMatchRecord();
+  const showSidebar = !screens.connect.classList.contains("hidden") || !screens.lobby.classList.contains("hidden");
+  sidebar.classList.toggle("hidden", !showSidebar);
+
+  if (!matchHistory.length) {
+    list.innerHTML = `<p class="history-empty">No saved matches yet.</p>`;
+    details.innerHTML = `<p class="history-empty">Finish a match to see placement, turns, start time, and winner here.</p>`;
+    return;
+  }
+
+  list.innerHTML = "";
+  matchHistory.forEach((match) => {
+    const btn = document.createElement("button");
+    btn.className = `history-item${match.matchId === selectedReplayId ? " active" : ""}`;
+    btn.innerHTML = `
+      <span class="history-item-title">${esc(match.lobbyId)}</span>
+      <span class="history-item-meta">${formatHistoryStamp(match.startedAt)} · ${getMatchSummary(match)}</span>
+      <span class="history-item-sub">${esc(match.winnerName || "Unknown winner")}</span>
+    `;
+    btn.addEventListener("click", () => {
+      selectedReplayId = match.matchId;
+      replayState.playing = false;
+      if (replayState.timer !== null) {
+        clearTimeout(replayState.timer);
+        replayState.timer = null;
+      }
+      replayState.eventIndex = 0;
+      renderHistorySidebar();
+      renderMatchHistoryPanel(false);
+    });
+    list.appendChild(btn);
+  });
+
+  if (!record) {
+    details.innerHTML = `<p class="history-empty">Select a match to inspect it.</p>`;
+    return;
+  }
+
+  const placement = record.viewerPlacement ?? computeViewerPlacement(record);
+  const totalPlayers = record.players.length;
+  details.innerHTML = `
+    <div class="history-detail-card">
+      <p class="history-detail-kicker">Selected match</p>
+      <h3 class="history-detail-title">${esc(record.lobbyId)}</h3>
+      <p class="history-detail-row"><span>Started</span><strong>${formatHistoryStamp(record.startedAt)}</strong></p>
+      <p class="history-detail-row"><span>Winner</span><strong style="color:${esc(record.players.find((p) => p.sessionId === record.winnerId)?.color || "#fff")}">${esc(record.winnerName || "Unknown")}</strong></p>
+      <p class="history-detail-row"><span>Placement</span><strong>${placement ? `${formatOrdinal(placement.rank)} of ${placement.totalPlayers}` : "—"}</strong></p>
+      <p class="history-detail-row"><span>Players</span><strong>${totalPlayers}</strong></p>
+      <p class="history-detail-row"><span>Turns</span><strong>${Math.max(0, record.turnCount ?? 0)} turn${(record.turnCount ?? 0) === 1 ? "" : "s"}</strong></p>
+    </div>
+  `;
+}
+
+
+function renderReplayViewer() {
+  const canvas = $("replay-canvas") as HTMLCanvasElement | null;
+  if (!canvas) return;
+  const record = getSelectedMatchRecord();
+  const ctx2 = canvas.getContext("2d");
+  if (!ctx2) return;
+
+  const W = canvas.clientWidth || canvas.width || 280;
+  const H = canvas.clientHeight || canvas.height || 180;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+  }
+  ctx2.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx2.fillStyle = "#0a0a14";
+  ctx2.fillRect(0, 0, W, H);
+
+  if (!record) {
+    ctx2.fillStyle = "rgba(255,255,255,0.5)";
+    ctx2.font = "600 14px system-ui, sans-serif";
+    ctx2.textAlign = "center";
+    ctx2.fillText("No replay selected", W / 2, H / 2);
+    return;
+  }
+
+  const snapshot = getSnapshotAt(record, replayState.eventIndex) ?? record.events[0]?.snapshot ?? null;
+  if (!snapshot) return;
+
+  drawReplayBoard(ctx2, W, H, snapshot);
+}
+
+function drawReplayBoard(
+  ctx2: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  snapshot: MatchReplaySnapshot,
+) {
+  const W = snapshot.gridWidth;
+  const H = snapshot.gridHeight;
+  if (!W || !H || !snapshot.cells.length) return;
+  const GAP = 10;
+  const cellSize = Math.max(GAP + 4, Math.min(Math.floor((width - GAP) / W), Math.floor((height - GAP) / H)));
+  const totalW = cellSize * W + GAP;
+  const totalH = cellSize * H + GAP;
+  const offX = Math.floor((width - totalW) / 2);
+  const offY = Math.floor((height - totalH) / 2);
+  const colors = colorblindMode ? GRID_COLORS_CB : GRID_COLORS_NORMAL;
+  const showSym = colorblindMode && cellSize >= 14;
+
+  const players = new Map(snapshot.players.map((p) => [p.sessionId, p]));
+  const roundedPath = (x: number, y: number, w: number, h: number, r: number) => {
+    ctx2.moveTo(x + r, y);
+    ctx2.lineTo(x + w - r, y);
+    ctx2.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx2.lineTo(x + w, y + h - r);
+    ctx2.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx2.lineTo(x + r, y + h);
+    ctx2.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx2.lineTo(x, y + r);
+    ctx2.quadraticCurveTo(x, y, x + r, y);
+    ctx2.closePath();
+  };
+
+  ctx2.fillStyle = "#050509";
+  ctx2.fillRect(offX, offY, totalW, totalH);
+
+  for (let i = 0; i < snapshot.cells.length; i++) {
+    const cell = snapshot.cells[i];
+    const col = i % W;
+    const row = Math.floor(i / W);
+    const x = offX + GAP + col * cellSize;
+    const y = offY + GAP + row * cellSize;
+    const w = cellSize - GAP;
+    const h = cellSize - GAP;
+    const cornerR = Math.max(2, Math.round((cellSize - GAP) * 0.1));
+    const owner = cell.ownerId ? players.get(cell.ownerId) : null;
+    const gColor = colors[cell.colorIndex] ?? "#888";
+
+    if (owner) {
+      const pColor = owner.color || PLAYER_COLORS[(owner.playerIndex ?? 0) % PLAYER_COLORS.length];
+      const bStyle = owner.borderStyle || "solid";
+      const bw = Math.max(2, Math.round(Math.min(w, h) * 0.2));
+      const iw = Math.max(4, w - 2 * bw);
+      const ih = Math.max(4, h - 2 * bw);
+      const ix = x + bw;
+      const iy = y + bw;
+      const ir = bStyle === "rounded" ? Math.round(Math.min(iw, ih) * 0.4) : Math.max(1, Math.round(Math.min(iw, ih) * 0.1));
+
+      ctx2.fillStyle = pColor;
+      ctx2.beginPath();
+      roundedPath(x, y, w, h, cornerR);
+      ctx2.fill();
+
+      ctx2.fillStyle = gColor;
+      ctx2.beginPath();
+      roundedPath(ix, iy, iw, ih, ir);
+      ctx2.fill();
+
+      if (bStyle === "double" && iw > 8) {
+        const aw = Math.max(1, Math.round(bw * 0.18));
+        ctx2.strokeStyle = pColor;
+        ctx2.lineWidth = aw;
+        ctx2.beginPath();
+        roundedPath(ix + aw / 2, iy + aw / 2, iw - aw, ih - aw, Math.max(0, ir - aw / 2));
+        ctx2.stroke();
+      }
+
+      if (showSym) drawCBSymbol(ctx2, cell.colorIndex, ix, iy, iw, ih);
+    } else {
+      ctx2.fillStyle = gColor;
+      ctx2.beginPath();
+      roundedPath(x, y, w, h, cornerR);
+      ctx2.fill();
+      ctx2.fillStyle = "rgba(0,0,0,0.28)";
+      ctx2.beginPath();
+      roundedPath(x, y, w, h, cornerR);
+      ctx2.fill();
+      if (showSym) drawCBSymbol(ctx2, cell.colorIndex, x, y, w, h);
+    }
+  }
+
+  const event = record.events[Math.min(replayState.eventIndex, record.events.length - 1)];
+  if (event) {
+    ctx2.fillStyle = "rgba(0,0,0,0.6)";
+    ctx2.fillRect(12, 12, Math.min(width - 24, 340), 48);
+    ctx2.fillStyle = "#fff";
+    ctx2.font = "600 14px system-ui, sans-serif";
+    ctx2.textAlign = "left";
+    ctx2.fillText(event.label, 22, 32);
+    ctx2.fillStyle = "rgba(255,255,255,0.72)";
+    ctx2.font = "12px system-ui, sans-serif";
+    ctx2.fillText(`${formatHistoryTime(event.at - record.startedAt)} · turn ${event.turn + 1}`, 22, 50);
+  }
 }

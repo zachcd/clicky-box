@@ -2,10 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Clicky Box</title>
-    <script type="module" crossorigin src="/assets/index-wniKNyeX.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-Cu9wie-k.css">
+    <script type="module" crossorigin src="/assets/index-CXDoZG7A.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DsOkuMK5.css">
   </head>
   <body>
 
@@ -72,7 +72,11 @@
     <div id="screen-game" class="screen screen-game hidden">
 
       <div id="hud">
-        <div id="timer-bar-wrap"><div id="timer-fill"></div></div>
+        <div id="timer-bar-outer">
+          <div id="timer-bar-wrap"><div id="timer-fill"></div></div>
+          <div id="ping-marker"></div>
+          <div id="ping-label"></div>
+        </div>
         <div id="hud-row">
           <span id="turn-counter"></span>
           <div id="score-board"></div>
@@ -109,12 +113,55 @@
         <h2 class="card-title">Game Over</h2>
         <p id="winner-line" class="winner-line"></p>
         <div id="final-scores" class="final-scores"></div>
+        <div id="accolades" class="accolades"></div>
         <p class="chart-title">Score history</p>
         <canvas id="score-chart" class="score-chart"></canvas>
         <p id="gameover-note" class="gameover-note"></p>
+
+        <div class="history-shell">
+          <div class="history-list-panel">
+            <p class="chart-title">Match history</p>
+            <div id="match-history-list" class="history-list"></div>
+          </div>
+
+          <div class="replay-panel">
+            <div class="replay-header">
+              <p id="replay-title" class="chart-title">Replay</p>
+              <div class="replay-controls">
+                <button id="replay-prev-btn" class="btn-text" title="Previous event">◀</button>
+                <button id="replay-play-btn" class="btn-text" title="Play / pause">Play</button>
+                <button id="replay-next-btn" class="btn-text" title="Next event">▶</button>
+                <label class="replay-speed-wrap">
+                  <span>Speed</span>
+                  <select id="replay-speed" aria-label="Replay speed">
+                    <option value="1">1×</option>
+                    <option value="2">2×</option>
+                    <option value="4">4×</option>
+                    <option value="6" selected>6×</option>
+                    <option value="8">8×</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <canvas id="replay-canvas" class="replay-canvas"></canvas>
+            <input id="replay-seek" class="replay-seek" type="range" min="0" max="0" value="0" />
+            <p id="replay-info" class="gameover-note"></p>
+            <div id="replay-timeline" class="replay-timeline"></div>
+          </div>
+        </div>
+
         <button id="play-again-btn" class="btn btn-primary">Back to Lobby</button>
       </div>
     </div>
+
+    <!-- ── Match history sidebar (non-game screens) ───────────────────────── -->
+    <aside id="history-sidebar" class="history-sidebar hidden" aria-label="Match history sidebar">
+      <div class="history-sidebar-card">
+        <p class="chart-title">Recent matches</p>
+        <div id="history-sidebar-list" class="history-list history-sidebar-list"></div>
+        <div id="history-sidebar-details" class="history-sidebar-details"></div>
+      </div>
+    </aside>
 
   </body>
 </html>

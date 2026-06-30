@@ -553,7 +553,16 @@ input[type="text"]:focus {
 
 @media (min-width: 680px) {
   #sidebar {
-    width: 168px;
+    /*
+     * Width scales with the viewport rather than being fixed.
+     * Reasoning: the canvas (play area) is the primary surface and should
+     * always dominate. ~16 vw gives the sidebar a proportional share of the
+     * screen — large enough to read on wide monitors, small enough to leave
+     * ample room for the grid. The clamp floor/ceiling prevent it from
+     * getting unusably narrow on small desktops or absurdly wide on
+     * ultra-wide displays.
+     */
+    width: clamp(160px, 16vw, 280px);
     padding: 10px;
   }
   /* Compact HUD score row hidden on desktop — sidebar takes over */
@@ -592,20 +601,37 @@ input[type="text"]:focus {
   text-transform: uppercase;
   letter-spacing: 0.7px;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 .sb-chart-label {
   margin-top: auto;
+  flex-shrink: 0;
+}
+
+/* sidebar-scores fills all remaining vertical space so entries can distribute */
+#sidebar-scores {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .sb-entry {
+  flex: 1;
+  min-height: 0;
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 0.78rem;
+  gap: var(--sb-gap, 5px);
+  font-size: var(--sb-font-size, 0.78rem);
   overflow: hidden;
 }
 .sb-entry.me {
   font-weight: 700;
+}
+/* override the global .dot size so sidebar dots scale with player count */
+.sb-entry .dot {
+  width: var(--sb-dot-size, 12px);
+  height: var(--sb-dot-size, 12px);
 }
 .sb-entry .pname {
   flex: 1;
@@ -615,13 +641,16 @@ input[type="text"]:focus {
 }
 .sb-entry .sb-score {
   color: var(--dim);
-  font-size: 0.7rem;
+  font-size: var(--sb-score-size, 0.7rem);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .live-chart {
   width: 100%;
-  height: 80px;
+  /* Scale with viewport height: taller screens get a more useful chart.
+     15 vh gives ~90 px at 600 px, ~135 px at 900 px, capped at 160 px. */
+  height: clamp(70px, 15vh, 160px);
   flex-shrink: 0;
   border-radius: 4px;
   display: block;
@@ -715,6 +744,12 @@ input[type="text"]:focus {
 }
 
 /* ── Game over ────────────────────────────────────────────────────────────── */
+/* Allow the card to be taller than the viewport and scroll into view */
+#screen-gameover {
+  align-items: flex-start;
+  padding: 1.5rem 0;
+  overflow-y: auto;
+}
 .winner-line {
   text-align: center;
   font-size: 1.35rem;
@@ -765,6 +800,226 @@ input[type="text"]:focus {
   height: 160px;
   border-radius: 6px;
   display: block;
+}
+
+.history-shell {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.9rem;
+}
+.history-list-panel,
+.replay-panel {
+  background: rgba(0, 0, 0, 0.14);
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 10px;
+  padding: 0.7rem;
+}
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.history-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+  display: grid;
+  gap: 0.15rem;
+  cursor: pointer;
+}
+.history-item.active {
+  border-color: #2a2a4a;
+}
+.history-item-title {
+  font-weight: 700;
+  font-size: 0.88rem;
+}
+.history-item-meta,
+.history-item-sub {
+  color: var(--dim);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-empty {
+  color: var(--dim);
+  font-size: 0.82rem;
+  text-align: center;
+  padding: 0.35rem 0;
+}
+.replay-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-bottom: 0.4rem;
+  flex-wrap: wrap;
+}
+.replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.replay-speed-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--dim);
+  font-size: 0.72rem;
+}
+.replay-speed-wrap select {
+  background: var(--bg);
+  border: 1px solid #2a2a4a;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.25rem 0.35rem;
+}
+.replay-canvas {
+  width: 100%;
+  height: 220px;
+  display: block;
+  border-radius: 8px;
+  background: #0a0a14;
+}
+.replay-seek {
+  width: 100%;
+  margin-top: 0.55rem;
+}
+.replay-timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.timeline-chip {
+  border: 1px solid #2a2a4a;
+  background: #10101c;
+  color: var(--dim);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+}
+.timeline-chip.active {
+  color: #fff;
+  border-color: var(--accent);
+  background: rgba(233, 69, 96, 0.18);
+}
+
+/* ── Non-game history sidebar ─────────────────────────────────────────────── */
+.history-sidebar {
+  position: fixed;
+  top: 4.5rem;
+  right: 1rem;
+  width: min(26rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 5.5rem);
+  z-index: 120;
+}
+.history-sidebar-card {
+  background: rgba(26, 26, 46, 0.96);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 14px;
+  padding: 0.9rem;
+  box-shadow: 0 12px 34px rgba(0,0,0,0.42);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-height: inherit;
+}
+.history-sidebar-list {
+  max-height: 19rem;
+}
+.history-sidebar-details {
+  border-top: 1px solid rgba(255,255,255,0.06);
+  padding-top: 0.75rem;
+}
+.history-detail-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.history-detail-kicker {
+  color: var(--dim);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.55px;
+}
+.history-detail-title {
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+.history-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+}
+.history-detail-row span {
+  color: var(--dim);
+}
+.history-detail-row strong {
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Accolades ────────────────────────────────────────────────────────────── */
+.accolades {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.accolades-title {
+  margin-bottom: 0.1rem !important;
+}
+.accolade-entry {
+  display: grid;
+  /* icon | label | player-name | stat */
+  grid-template-columns: 1.4rem 4.4rem 1fr auto;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.42rem 0.65rem;
+  background: var(--bg);
+  border-radius: 8px;
+  font-size: 0.82rem;
+  min-width: 0;
+}
+.accolade-icon {
+  font-size: 1rem;
+  line-height: 1;
+  text-align: center;
+}
+.accolade-label {
+  font-weight: 700;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.accolade-player {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.accolade-stat {
+  color: var(--dim);
+  font-size: 0.72rem;
+  white-space: nowrap;
+  text-align: right;
 }
 
 /* ── Lobby slug row (connect screen) ────────────────────────────────────── */

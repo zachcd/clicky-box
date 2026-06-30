@@ -84,6 +84,13 @@ export class GameRoom extends Room<GameRoomState> {
   private turnStartTime:        number                                          = 0;
   private allOccupied:          boolean                                         = false; // Phase 2 flag
   private scoreHistory:         Map<string, number[]>                          = new Map();
+  // ── End-of-game accolade tracking ─────────────────────────────────────────
+  private eliminated:           Set<string>                                    = new Set();
+  private eliminationOrder:     string[]                                       = [];        // sids, first out → last
+  private raceWins:             Map<string, number>                            = new Map(); // sid → races won
+  private colorPickCounts:      Map<string, number[]>                          = new Map(); // sid → [R,B,G,O] picks
+  private cellHoldStreaks:      Map<number, { ownerId: string; streak: number }> = new Map(); // cellIdx → streak
+  private playerMaxCellStreak:  Map<string, number>                            = new Map(); // sid → longest single-cell hold
   private turnIntervalRef:      ReturnType<typeof setInterval> | null           = null;
   private countdownIntervalRef: ReturnType<typeof setInterval> | null           = null;
   private resetTimerRef:        ReturnType<typeof setTimeout>  | null           = null;
@@ -346,6 +353,19 @@ export class GameRoom extends Room<GameRoomState> {
     this.scoreHistory = new Map();
     players.forEach(p => this.scoreHistory.set(p.sessionId, [1])); // seed with starting score
 
+    // Initialise accolade trackers
+    this.eliminated          = new Set();
+    this.eliminationOrder    = [];
+    this.raceWins            = new Map();
+    this.colorPickCounts     = new Map();
+    this.cellHoldStreaks      = new Map();
+    this.playerMaxCellStreak = new Map();
+    players.forEach(p => {
+      this.colorPickCounts.set(p.sessionId, [0, 0, 0, 0]);
+      this.raceWins.set(p.sessionId, 0);
+      this.playerMaxCellStreak.set(p.sessionId, 0);
+    });
+
     this.state.phase               = "playing";
     this.state.currentTurn         = 0;
     this.state.winnerId            = "";
@@ -579,6 +599,26 @@ export class GameRoom extends Room<GameRoomState> {
     // Sorted ascending by receivedAt: the LAST player to submit a colour
     // wins any contested group — the most-recent input always prevails.
     this.submissionOrder.sort((a, b) => a.receivedAt - b.receivedAt);
+
+    // ── Track colour picks and detect race winners ─────────────────────────
+    // submissionOrder is sorted ascending by receivedAt, so the LAST entry for
+    // a given colour is the latest submission — that player wins any race.
+    {
+      const colorGroups = new Map<number, string[]>(); // colorIdx → [sids in arrival order]
+      for (const { playerId, colorIndex } of this.submissionOrder) {
+        const picks = this.colorPickCounts.get(playerId);
+        if (picks) picks[colorIndex]++;
+        if (!colorGroups.has(colorIndex)) colorGroups.set(colorIndex, []);
+        colorGroups.get(colorIndex)!.push(playerId);
+      }
+      for (const group of colorGroups.values()) {
+        if (group.length >= 2) {
+          const winner = group[group.length - 1]; // latest submission wins the contest
+          this.raceWins.set(winner, (this.raceWins.get(winner) ?? 0) + 1);
+        }
+      }
+    }
+
     for (const { playerId, colorIndex } of this.submissionOrder) {
       const captured = this.captureArea(playerId, colorIndex);
       for (const idx of captured) {
@@ -596,6 +636,29 @@ export class GameRoom extends Room<GameRoomState> {
     }
     this.state.players.forEach((p: Player, id: string) => {
       p.score = counts.get(id) ?? 0;
+    });
+
+    // ── Update per-cell ownership streaks ─────────────────────────────────
+    for (let i = 0; i < this.state.cells.length; i++) {
+      const ownerId = this.state.cells[i].ownerId;
+      if (!ownerId) { this.cellHoldStreaks.delete(i); continue; }
+      const entry = this.cellHoldStreaks.get(i);
+      if (entry && entry.ownerId === ownerId) {
+        entry.streak++;
+      } else {
+        this.cellHoldStreaks.set(i, { ownerId, streak: 1 });
+      }
+      const streak = this.cellHoldStreaks.get(i)!.streak;
+      const prevMax = this.playerMaxCellStreak.get(ownerId) ?? 0;
+      if (streak > prevMax) this.playerMaxCellStreak.set(ownerId, streak);
+    }
+
+    // ── Record newly eliminated players ───────────────────────────────────
+    this.state.players.forEach((p: Player, id: string) => {
+      if (p.score === 0 && !this.eliminated.has(id)) {
+        this.eliminated.add(id);
+        this.eliminationOrder.push(id);
+      }
     });
 
     // Snapshot scores for the end-of-game chart
@@ -791,17 +854,109 @@ export class GameRoom extends Room<GameRoomState> {
     const w = this.state.players.get(winnerId);
     console.log(`[game]  over — winner: ${w?.name ?? "?"} (${w?.score ?? 0} cells)`);
 
-    // Broadcast the per-turn score history so the client can draw the chart
+    // Finalise elimination order.
+    // Any players still alive at game-end (score > 0, not the winner) are
+    // sorted ascending by final score so the weakest ranks lowest.
+    const nonEliminated = [...this.state.players.entries()]
+      .filter(([id]) => !this.eliminated.has(id) && id !== winnerId)
+      .sort(([, a], [, b]) => a.score - b.score);
+    for (const [id] of nonEliminated) this.eliminationOrder.push(id);
+    this.eliminationOrder.push(winnerId); // winner is always last (= rank #1)
+
+    // Broadcast score history + accolades
+    const totalCells = this.state.gridWidth * this.state.gridHeight;
     const histPlayers: Array<{ name: string; color: string; scores: number[] }> = [];
     this.state.players.forEach((p: Player, sid: string) => {
       histPlayers.push({ name: p.name, color: p.playerColor, scores: this.scoreHistory.get(sid) ?? [] });
     });
     this.broadcast("scoreHistory", {
-      totalCells: this.state.gridWidth * this.state.gridHeight,
-      players:    histPlayers,
+      totalCells,
+      players:          histPlayers,
+      eliminationOrder: this.eliminationOrder,
+      accolades:        this.computeAccolades(totalCells),
     });
 
     this.resetTimerRef = setTimeout(() => { this.resetTimerRef = null; this.resetToLobby(); }, 10_000);
+  }
+
+  // ── Accolade computation ──────────────────────────────────────────────────
+
+  private computeAccolades(totalCells: number): Record<string, unknown> {
+    const playerCount = Math.max(1, this.state.players.size);
+
+    // ── Survivor ────────────────────────────────────────────────────────────
+    // "Low" score = at most half the fair share for one player.
+    // Rounded to a nice number so the display reads naturally.
+    const rawThreshold = totalCells / (playerCount * 2);
+    const lowThreshold = roundToNice(rawThreshold);
+
+    let survivorId    = "";
+    let survivorScore = 0; // weighted (streak-triangular)
+    let survivorCount = 0; // raw turn count for display
+
+    this.scoreHistory.forEach((scores, sid) => {
+      let weighted = 0, streak = 0, count = 0;
+      for (const s of scores) {
+        if (s > 0 && s <= lowThreshold) {
+          streak++; count++;
+          weighted += streak; // 1+2+…+k for a streak of k — rewards continuity
+        } else {
+          streak = 0;
+        }
+      }
+      if (weighted > survivorScore ||
+          (weighted === survivorScore && count > survivorCount)) {
+        survivorScore = weighted; survivorId = sid; survivorCount = count;
+      }
+    });
+
+    // ── Color Fan ────────────────────────────────────────────────────────────
+    let colorFanId     = "";
+    let colorFanTopIdx = 0;
+    let colorFanTop    = 0;
+    let colorFanSecond = 0;
+
+    this.colorPickCounts.forEach((counts, sid) => {
+      let topIdx = 0;
+      for (let i = 1; i < 4; i++) if (counts[i] > counts[topIdx]) topIdx = i;
+      const sorted = [...counts].sort((a, b) => b - a);
+      const top = sorted[0], second = sorted[1] ?? 0;
+      // Winner = highest top-colour count; tie-break by largest gap over 2nd
+      if (top > colorFanTop ||
+          (top === colorFanTop && (top - second) > (colorFanTop - colorFanSecond))) {
+        colorFanTop = top; colorFanSecond = second;
+        colorFanTopIdx = topIdx; colorFanId = sid;
+      }
+    });
+
+    // ── Racer ────────────────────────────────────────────────────────────────
+    let racerId   = "";
+    let racerWins = 0;
+    this.raceWins.forEach((w, sid) => {
+      if (w > racerWins) { racerWins = w; racerId = sid; }
+    });
+
+    // ── Holder ───────────────────────────────────────────────────────────────
+    let holderId     = "";
+    let holderStreak = 0;
+    this.playerMaxCellStreak.forEach((s, sid) => {
+      if (s > holderStreak) { holderStreak = s; holderId = sid; }
+    });
+
+    return {
+      survivor: survivorCount > 0
+        ? { playerId: survivorId, turnsCount: survivorCount, threshold: lowThreshold }
+        : null,
+      colorFan: colorFanTop > 0
+        ? { playerId: colorFanId, topColor: colorFanTopIdx, topCount: colorFanTop, secondCount: colorFanSecond }
+        : null,
+      racer: racerWins > 0
+        ? { playerId: racerId, wins: racerWins }
+        : null,
+      holder: holderStreak > 0
+        ? { playerId: holderId, streak: holderStreak }
+        : null,
+    };
   }
 
   private resetToLobby() {
@@ -815,7 +970,13 @@ export class GameRoom extends Room<GameRoomState> {
       p.score = 0; p.captures = 0; p.ready = false; p.hasSubmitted = false; p.submittedColor = -1;
       p.kickEligible = false; p.voteKickCount = 0;
     });
-    this.scoreHistory = new Map();
+    this.scoreHistory        = new Map();
+    this.eliminated          = new Set();
+    this.eliminationOrder    = [];
+    this.raceWins            = new Map();
+    this.colorPickCounts     = new Map();
+    this.cellHoldStreaks      = new Map();
+    this.playerMaxCellStreak = new Map();
 
     this.state.cells.splice(0, this.state.cells.length);
     this.state.gridWidth           = 0;
@@ -858,6 +1019,15 @@ export class GameRoom extends Room<GameRoomState> {
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
+
+/** Round n to a legible "nice" number for display in the Survivor accolade. */
+function roundToNice(n: number): number {
+  if (n <= 0)   return 1;
+  if (n <= 10)  return Math.max(1, Math.round(n));
+  if (n <= 30)  return Math.round(n / 5)  * 5;
+  if (n <= 100) return Math.round(n / 10) * 10;
+  return               Math.round(n / 25) * 25;
+}
 
 function sanitiseLobbyId(raw: string | undefined): string {
   if (!raw) return "global";
